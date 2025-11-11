@@ -1,0 +1,2258 @@
+#!/bin/bash
+#
+# - yuriy.ilnytsky@datarobot.com
+# Script version: 11.1.2.1159_2025-10-29
+#
+#### #### #### #### #### #### #### ####
+DEBUG=false
+
+DR_APP="datarobot-app"      # by default, can be redefined with params
+DR_PCS="datarobot-pcs"      # by default, can be redefined with params
+
+#### #### #### #### #### #### #### ####
+ERROR () {
+        echo; echo "# ERROR."; echo "$@"; echo; exit 1
+}
+
+#### #### #### #### #### #### #### ####
+check_tool () {
+        ${1} --help >/dev/null 2>&1 || ERROR "${1} not found"
+}
+
+#### #### #### #### #### #### #### ####
+SYSTEM_OUTPUT=''
+SYSTEM_ERROR=''
+SYSTEM_EXITCODE=0
+SYSTEM () {
+        local OUT=''
+        local COMMAND=''
+        local IGNORE_ERRORS=false
+        SYSTEM_OUTPUT=''
+        SYSTEM_ERROR=''
+        SYSTEM_EXITCODE=0
+        while [ -n "$1" ]; do
+                echo "$1"|egrep -i '^-*ignore-*errors*.*|^-i' >/dev/null && IGNORE_ERRORS=true || COMMAND="${COMMAND} ${1}"
+                shift
+        done; COMMAND=${COMMAND/ /}
+        [ -z "${COMMAND}" ] && ERROR "function SYSTEM received no data to execute"
+        ${DEBUG} && echo "> ${COMMAND}"
+        if ! OUT=$(/bin/bash -c "${COMMAND}" 2>&1); then
+                SYSTEM_EXITCODE=$?
+                SYSTEM_ERROR="${OUT}"
+                ${IGNORE_ERRORS} && return 1
+                echo "${OUT}"
+                ERROR "Failed command: ${COMMAND}"
+        fi
+        SYSTEM_OUTPUT="${OUT}"
+        return 0
+}
+
+#### #### #### #### #### #### #### ####
+pcs_rabbit_config () {
+	[ -z "$3" ] && echo "Procedure pcs_rabbit_config missing params" && exit 1
+	local FF="$1"
+	local SS="$2"
+	local ADD="$3"
+	if cat ${FF}|awk 'BEGIN{edit=0}{if(edit==0){if(/^rabbitmq/){edit=1}}else{if(/^[A-Za-z]/){edit=0}else{print}}}'|grep "${SS}" >/dev/null; then
+		echo "|   |   |-- found [${FF}]: ${SS}"
+	else
+		sed -i "s/^rabbitmq:/rabbitmq:\n  ${ADD}/g" ${FF}
+		echo "|   |   |-- added [${FF}]: ${ADD}"
+	fi
+}
+
+#### #### #### #### #### #### #### ####
+check_mongodb () {
+  local STATUS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-mongo-0 -- bash -c 'echo "rs.status()"|mongosh -u ${MONGODB_ROOT_USER} -p ${MONGODB_ROOT_PASSWORD}') || ERROR "Cannot retrieve rs.status() from pcs-mongo-0"
+  echo "#-- MongoDB cluster details"
+  echo "${STATUS}"|grep -E 'name:|state'|sed "s#^\s*##g;s#^name:#\#   |-- name:#g;s#^state:#\#   |   |-- state:#g;s#^stateStr:#\#   |   '-- stateStr:#g;"
+  echo "#   '-- MongoDB cluster details"
+	kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-mongo-0 -- bash -c 'echo "rs.isMaster().primary"|mongosh -u ${MONGODB_ROOT_USER} -p ${MONGODB_ROOT_PASSWORD}'|grep ^pcs-mongo-0 >/dev/null 2>&1 || ERROR "#### if pcs-mongo-0 is not master, make sure it is master before processing"
+}
+
+#### #### #### #### #### #### #### ####
+check_postgresql () {
+	local PGSTATUS=$(kubectl exec -i -t -n ${DR_CORE_NAMESPACE} pcs-postgresql-0 -c postgresql -- bash -c "/opt/bitnami/scripts/postgresql-repmgr/entrypoint.sh repmgr cluster show -f /opt/bitnami/repmgr/conf/repmgr.conf --compact" 2>&1|grep -v 'command terminated with exit code 25' |grep -v postgresql-repmgr|grep -v '^\s*$')
+	echo "#### PostgreSQL cluster status:"
+	echo "${PGSTATUS}"|sed 's/^/# /g'
+	echo "${PGSTATUS}"|grep 'pcs-postgresql-0'|grep '* running'>/dev/null 2>&1 || ERROR "#### if pcs-postgresql-0 is not master, make sure it is master before processing,
+#### run the following command against the current master to push it out: 
+kubectl exec -i -t -n ${DR_CORE_NAMESPACE} pcs-postgresql-X -- bash -c '/opt/bitnami/postgresql/bin/pg_ctl -D /bitnami/postgresql/data -m fast stop'"
+}
+
+#### #### #### #### #### #### #### ####
+do_crd () {
+  $1 >/dev/null
+  echo "|   |   |-- $1"
+}
+
+#### #### #### #### #### #### #### ####
+# CRDs labels and annotations
+#### #### #### #### #### #### #### ####
+do_crds () {
+  echo "|   |-- CRDs labels and annotations"
+  # 01
+  do_crd "kubectl label crd/notebooks.notebook.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite"
+  # 02
+  do_crd "kubectl annotate crd/notebooks.notebook.datarobot.com meta.helm.sh/release-name=dr --overwrite"
+  # 03
+  do_crd "kubectl annotate crd/notebooks.notebook.datarobot.com meta.helm.sh/release-namespace=$NS --overwrite"
+  # 04
+  do_crd "kubectl label crd/notebookvolumes.notebook.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite"
+  # 05
+  do_crd "kubectl annotate crd/notebookvolumes.notebook.datarobot.com meta.helm.sh/release-name=dr --overwrite"
+  # 06
+  do_crd "kubectl annotate crd/notebookvolumes.notebook.datarobot.com meta.helm.sh/release-namespace=$NS --overwrite"
+  # 07
+  do_crd "kubectl label crd/notebookvolumesnapshots.notebook.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite"
+  # 08
+  do_crd "kubectl annotate crd/notebookvolumesnapshots.notebook.datarobot.com meta.helm.sh/release-name=dr --overwrite"
+  # 09
+  do_crd "kubectl annotate crd/notebookvolumesnapshots.notebook.datarobot.com meta.helm.sh/release-namespace=$NS --overwrite"
+  # 10
+  do_crd "kubectl label crd/lrs.lrs.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite"
+  # 11
+  do_crd "kubectl annotate crd/lrs.lrs.datarobot.com meta.helm.sh/release-name=dr --overwrite"
+  # 12
+  do_crd "kubectl annotate crd/lrs.lrs.datarobot.com meta.helm.sh/release-namespace=$NS --overwrite"
+  # 13
+  do_crd "kubectl label crd/executionenvironments.predictions.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite"
+  # 14
+  do_crd "kubectl annotate crd/executionenvironments.predictions.datarobot.com meta.helm.sh/release-name=dr --overwrite"
+  # 15
+  do_crd "kubectl annotate crd/executionenvironments.predictions.datarobot.com meta.helm.sh/release-namespace=$NS --overwrite"
+  # 16
+  do_crd "kubectl label crd/inferenceservers.predictions.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite"
+  # 17
+  do_crd "kubectl annotate crd/inferenceservers.predictions.datarobot.com meta.helm.sh/release-name=dr --overwrite"
+  # 18
+  do_crd "kubectl annotate crd/inferenceservers.predictions.datarobot.com meta.helm.sh/release-namespace=$NS --overwrite"
+  # #
+  echo "|   |   '-- CRDs labels and annotations"
+}
+
+#### #### #### #### #### #### #### ####
+# Postgresql: deleting 2 functions and aggregate
+#### #### #### #### #### #### #### ####
+do_postgresql_delete_resources () {
+    echo "|   |-- PostgreSQL functions and aggregade"
+    if kubectl exec -i -t -n "$NS" pcs-postgresql-0 -- sh -c 'export PGPASSWORD="$POSTGRES_POSTGRES_PASSWORD"; psql -U postgres -d modmon -t <<EOF
+SELECT '\''validate_bh_tt_count_less_than'\'' AS object,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+           WHERE p.proname = '\''validate_bh_tt_count_less_than'\''
+       ) THEN '\''EXISTS'\'' ELSE '\''DOES NOT EXIST'\'' END;
+SELECT '\''validate_bh_tt_percentiles'\'' AS object,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+           WHERE p.proname = '\''validate_bh_tt_percentiles'\''
+       ) THEN '\''EXISTS'\'' ELSE '\''DOES NOT EXIST'\'' END;
+SELECT '\''array_cat_agg'\'' AS object,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM pg_aggregate a
+           JOIN pg_proc p ON a.aggfnoid = p.oid
+           WHERE p.proname = '\''array_cat_agg'\''
+       ) THEN '\''EXISTS'\'' ELSE '\''DOES NOT EXIST'\'' END;
+EOF'|grep EXISTS >/dev/null; then
+      echo "|   |   |-- Resources found to be deleted"
+      kubectl exec -i -t -n $NS pcs-postgresql-0 -- sh -c 'export PGPASSWORD="$POSTGRES_POSTGRES_PASSWORD"; psql -U postgres -d modmon <<EOF
+DROP FUNCTION IF EXISTS validate_bh_tt_count_less_than(
+        actual_value_count integer,
+        unique_value_count integer,
+        aggregate_record_count integer,
+        min_value double precision,
+        max_value double precision,
+        thresholds double precision[],
+        random_seed double precision );
+DROP FUNCTION IF EXISTS validate_bh_tt_percentiles(
+        actual_value_count integer,
+        unique_value_count integer,
+        aggregate_record_count integer,
+        min_value double precision,
+        max_value double precision,
+        percentiles double precision[],
+        random_seed double precision);
+DROP AGGREGATE IF EXISTS array_cat_agg(anyarray);
+EOF' >/dev/null 2>&1
+        if kubectl exec -i -t -n "$NS" pcs-postgresql-0 -- sh -c 'export PGPASSWORD="$POSTGRES_POSTGRES_PASSWORD"; psql -U postgres -d modmon -t <<EOF
+SELECT '\''validate_bh_tt_count_less_than'\'' AS object,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+           WHERE p.proname = '\''validate_bh_tt_count_less_than'\''
+       ) THEN '\''EXISTS'\'' ELSE '\''DOES NOT EXIST'\'' END;
+SELECT '\''validate_bh_tt_percentiles'\'' AS object,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+           WHERE p.proname = '\''validate_bh_tt_percentiles'\''
+       ) THEN '\''EXISTS'\'' ELSE '\''DOES NOT EXIST'\'' END;
+SELECT '\''array_cat_agg'\'' AS object,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM pg_aggregate a
+           JOIN pg_proc p ON a.aggfnoid = p.oid
+           WHERE p.proname = '\''array_cat_agg'\''
+       ) THEN '\''EXISTS'\'' ELSE '\''DOES NOT EXIST'\'' END;
+EOF'|grep EXISTS >/dev/null; then
+        ERROR "Failed to delete PostgreSQL resources"
+      else
+        echo "|   |   '-- Resources deleted"
+      fi
+    else 
+      echo "|   |   '-- Resources not found to be deleted"
+    fi
+}
+
+#### #### #### #### #### #### #### ####
+# PASSWORD LENGTH
+#### #### #### #### #### #### #### ####
+password_legth_fix () {
+    echo "|   |-- Passwords length check"
+    local MONGODB_ROOT_USER="pcs-mongodb"
+    local MONGODB_OLD_ROOT_PASSWORD=$(kubectl get secret --namespace $NS pcs-mongo -o jsonpath="{.data.mongodb-root-password}" | base64 -d) || ERROR "Cannot get MongoDB password"
+    local PLENGTH=$(echo "${MONGODB_OLD_ROOT_PASSWORD}"|wc -c)
+    echo "|   |   |-- MongoDB password: ${MONGODB_OLD_ROOT_PASSWORD}" # [Length: ${PLENGTH}]"
+    if [[ ${PLENGTH} -lt 10 ]]; then
+      echo "Recovered MongoDB password too short"
+      exit 1
+    elif [[ ${PLENGTH} -lt 16 ]]; then
+      echo "|   |   |   |-- MongoDB password should be recreated"
+      MONGODB_NEW_ROOT_PASSWORD=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 18 )
+      echo "|   |   |   |-- MongoDB new password: ${MONGODB_NEW_ROOT_PASSWORD}"
+      echo "MongoDB-old: ${MONGODB_OLD_ROOT_PASSWORD}, MongoDB-new: ${MONGODB_NEW_ROOT_PASSWORD}" >> passwords.txt
+      kubectl -n ${NS} -it exec pcs-mongo-0 -- bash -c "mongosh --username $MONGODB_ROOT_USER --password $MONGODB_OLD_ROOT_PASSWORD --host pcs-mongo-headless --authenticationDatabase admin  --eval \"use admin;\" --eval \"db.changeUserPassword('$MONGODB_ROOT_USER', '$MONGODB_NEW_ROOT_PASSWORD')\" " >/dev/null 2>&1 || ERROR "Cannot update MongoDB password"
+      echo "|   |   |   |-- MongoDB password updated"
+      kubectl -n ${NS} patch secret pcs-mongo -p "{\"stringData\":{\"mongodb-root-password\":\"$MONGODB_NEW_ROOT_PASSWORD\"}}" >/dev/null 2>&1 || ERROR "Cannot patch pcs-mongo secret"
+      echo "|   |   |   |-- pcs-mongo secret patched"
+      echo "|   |   |   |-- restarting sts pcs-mongo"
+      kubectl -n ${NS} rollout restart sts pcs-mongo |sed 's/^/|   |   |   |-- /g'
+      kubectl -n ${NS} rollout status sts pcs-mongo --timeout 10m |sed 's/^/|   |   |   |-- /g'
+      echo "|   |   |   '-- MongoDB password updated"
+    else
+      echo "|   |   |   '-- MongoDB password length is OK"
+    fi
+ 
+    #echo "|   |   |-- RabbitMQ password length"
+    local PPPP=$(kubectl get secret --namespace $NS pcs-rabbitmq -o jsonpath="{.data.rabbitmq-password}" | base64 -d) || ERROR "Cannot get RabbitMQ password"
+    local PLENGTH=$(echo "${PPPP}"|wc -c)
+    echo "|   |   |-- RabbitMQ password: ${PPPP}" # [Length: ${PLENGTH}]"
+    if [[ ${PLENGTH} -lt 10 ]]; then
+      echo "Recovered password too short"
+      exit 1
+    elif [[ ${PLENGTH} -lt 16 ]]; then
+      echo "|   |   |   |-- password should be recreated"
+      NEWSECRET=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 18 | base64)
+      echo "|   |   |   |-- new password: ${NEWSECRET}"
+      echo "RabbitMQ-old: ${PPPP}, RabbitMQ-new: ${NEWSECRET}" >> passwords.txt
+      kubectl patch secret pcs-rabbitmq -n $NS -p "{\"data\":{\"rabbitmq-password\":\"$NEWSECRET\"}}" >/dev/null 2>&1 || ERROR "Cannot patch secret"
+      echo "|   |   |   |-- pcs-rabbitmq secret patched"
+      echo "|   |   |   |-- restarting sts pcs-rabbitmq"
+      kubectl -n ${NS} rollout restart sts pcs-rabbitmq |sed 's/^/|   |   |   |-- /g'
+      kubectl -n ${NS} rollout status sts pcs-rabbitmq --timeout 10m |sed 's/^/|   |   |   |-- /g'
+      echo "|   |   |   '-- RabbitMQ password updated"
+    else
+      echo "|   |   |   '-- RabbitMQ password length is OK"
+    fi
+ 
+    #echo "|   |   |-- Redis password length"
+    local PPPP=$(kubectl get secret --namespace $NS pcs-redis -o jsonpath="{.data.redis-password}" | base64 -d) || ERROR "Cannot get Redis password"
+    local PLENGTH=$(echo "${PPPP}"|wc -c)
+    echo "|   |   |-- Redis password: ${PPPP}" # [Length: ${PLENGTH}]"
+    if [[ ${PLENGTH} -lt 10 ]]; then
+      echo "Recovered password too short"
+      exit 1
+    elif [[ ${PLENGTH} -lt 16 ]]; then
+      echo "|   |   |   |-- password should be recreated"
+      NEWSECRET=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 18 | base64)
+      echo "|   |   |   |-- new password: ${NEWSECRET}"
+      echo "Redis-old: ${PPPP}, Redis-new: ${NEWSECRET}" >> passwords.txt
+      kubectl patch secret pcs-redis -n $NS -p "{\"data\":{\"redis-password\":\"$NEWSECRET\"}}" >/dev/null 2>&1 || ERROR "Cannot patch secret"
+      echo "|   |   |   |-- pcs-redis secret patched"
+      echo "|   |   |   |-- restarting sts pcs-redis-node"
+      kubectl -n ${NS} rollout restart sts pcs-redis-node |sed 's/^/|   |   |   |-- /g'
+      kubectl -n ${NS} rollout status sts pcs-redis-node --timeout 10m |sed 's/^/|   |   |   |-- /g'
+      echo "|   |   |   '-- Redis password updated"
+    else
+      echo "|   |   |   '-- Redis password length is OK"
+    fi
+    
+    #echo "|   |   |-- Elasticsearch password length"
+    local PPPP=$(kubectl get secret --namespace $NS pcs-elasticsearch -o jsonpath="{.data.elasticsearch-password}" | base64 -d) || ERROR "Cannot get Elasticsearch password"
+    local PLENGTH=$(echo "${PPPP}"|wc -c)
+    echo "|   |   |-- Elasticsearch password: ${PPPP}" # [Length: ${PLENGTH}]"
+    if [[ ${PLENGTH} -lt 10 ]]; then
+      echo "Recovered password too short"
+      exit 1
+    elif [[ ${PLENGTH} -lt 16 ]]; then
+      echo "|   |   |   |-- password should be recreated"
+      NEWSECRET=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 18 | base64)
+      echo "|   |   |   |-- new password: ${NEWSECRET}"
+      echo "Elasticsearch-old: ${PPPP}, Elasticsearch-new: ${NEWSECRET}" >> passwords.txt
+      kubectl patch secret pcs-elasticsearch -n $NS -p "{\"data\":{\"elasticsearch-password\":\"$NEWSECRET\"}}" >/dev/null 2>&1 || ERROR "Cannot patch secret"
+      echo "|   |   |   |-- pcs-elasticsearch secret patched"
+      echo "|   |   |   |-- restarting sts pcs-elasticsearch-master"
+      kubectl -n ${NS} rollout restart sts pcs-elasticsearch-master |sed 's/^/|   |   |   |-- /g'
+      kubectl -n ${NS} rollout status sts pcs-elasticsearch-master --timeout 10m |sed 's/^/|   |   |   |-- /g'
+      echo "|   |   |   '-- Elasticsearch password updated"
+    else
+      echo "|   |   |   '-- Elasticsearch password length is OK"
+    fi
+    echo "|   |   '-- Passwords length"
+}
+
+#### #### #### #### #### #### #### ####
+# MongoDB version check/upgrade
+#### #### #### #### #### #### #### ####
+mongodb_compatibility () {
+    echo "|   |-- MongoDB featureCompatibilityVersion check"
+    if kubectl -n ${NS} exec -it pcs-mongo-0 -- bash -c 'mongosh admin -u ${MONGODB_ROOT_USER} -p ${MONGODB_ROOT_PASSWORD} --eval "db.adminCommand({ getParameter: 1, featureCompatibilityVersion: 1 })"'|grep featureCompatibilityVersion|grep "'5\.0'" >/dev/null; then
+      echo "|   |   |-- featureCompatibilityVersion is 5.0, update is required"
+      if OUT=$(kubectl -n ${NS} exec -it pcs-mongo-0 -- bash -c 'mongosh admin -u ${MONGODB_ROOT_USER} -p ${MONGODB_ROOT_PASSWORD} --authenticationDatabase admin --eval "db.adminCommand({ setFeatureCompatibilityVersion: \"6.0\" })"' 2>&1); then
+        echo "|   |   '-- featureCompatibilityVersion set to be 6.0"
+      else
+        echo "${OUT}"
+        exit 1
+      fi
+    else
+      if kubectl -n ${NS} exec -it pcs-mongo-0 -- bash -c 'mongosh admin -u ${MONGODB_ROOT_USER} -p ${MONGODB_ROOT_PASSWORD} --eval "db.adminCommand({ getParameter: 1, featureCompatibilityVersion: 1 })"'|grep featureCompatibilityVersion|grep "'6\.0'" >/dev/null; then
+        echo "|   |   '-- featureCompatibilityVersion is 6.0"
+      else
+        echo "Unknown featureCompatibilityVersion version, check it manually"
+        exit 1
+      fi
+    fi
+}
+
+#### #### #### #### #### #### #### ####
+# MongoDB version check/upgrade
+#### #### #### #### #### #### #### ####
+mongodb_version () {
+  local ACT="$1"
+  [ -z "${ACT}" ] && ACT="test"
+  local MDB_IMAGE=$(kubectl -n ${NS} get sts pcs-mongo -o yaml|grep image:|awk '{print $2}')
+  [ -z "${MDB_IMAGE}" ] && ERROR "pcs-mongo image not found"
+  echo "|   |-- MongoDB image: ${MDB_IMAGE}"
+  if echo "${MDB_IMAGE}"|grep mirror_chainguard_datarobot.com_mongodb-bitnami-fips:[67].0 >/dev/null; then
+    echo "|   |   '-- no MongoDB upgrade required"
+  else
+    echo "|   |   |-- MongoDB upgrade to version 6 required"
+    IMAGEREGISTRY=$(awk '/^global:/ { in_global=1; next };in_global && /^[[:space:]]*imageRegistry:/ { print "imageRegistry:", $2; exit }' datarobot-values.yaml|awk '{print $2}')
+    [ -z "${IMAGEREGISTRY}" ] && ERROR "Image registry not found in values"
+    echo "|   |   |-- Images registry: ${IMAGEREGISTRY}"
+    echo "|   |   |-- Upgrade image name: ${IMAGEREGISTRY}/datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips:6.0"
+    echo "|   |   |-- Checking the image running docker manifest inspect"
+    if OUT=$(docker manifest inspect ${IMAGEREGISTRY}/datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips:6.0 2>&1); then
+      echo "|   |   |   '-- Image found: ${IMAGEREGISTRY}/datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips:6.0"
+    else
+      echo "|   |   |   '-- Image check error"
+      echo
+      echo "${OUT}"
+      echo
+      echo "# If error related to access, fix it and/or docker log into ${IMAGEREGISTRY}"
+      echo "#"
+      echo "# If access is OK but the image is missing:"
+      echo "# Load the image from docker.io/datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips:6.0"
+      echo "# and push to ${IMAGEREGISTRY}:"
+      echo
+      echo " docker pull docker.io/datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips:6.0"
+      echo " docker tag datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips:6.0 ${IMAGEREGISTRY}/datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips:6.0"
+      #echo " aws ecr create-repository --repository-name ${IMAGEREGISTRY}/datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips --region us-east-1"
+      echo " docker push ${IMAGEREGISTRY}/datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips:6.0"
+      echo
+      echo "# And rerun the upgrade again"
+      exit 1
+      # aws ecr get-login-password --region us-east-1
+      # docker login -u ${DOCKER_REGISTRY_USERNAME} -p ${DOCKER_REGISTRY_PASSWORD} ${DOCKER_REGISTRY_URL}
+      #
+      # docker login -u AWS -p $(aws ecr get-login-password --region us-east-1) ${DOCKER_REGISTRY_URL}
+      #
+    fi
+    if [ "${ACT}" = "process" ]; then
+      echo "|   |   |-- Updating the image"
+      kubectl -n ${NS} set image statefulset/pcs-mongo mongodb=${IMAGEREGISTRY}/datarobot/mirror_chainguard_datarobot.com_mongodb-bitnami-fips:6.0 >/dev/null || exit 1
+      echo "|   |   |   |-- image updated, restarting"
+      #kubectl -n ${NS} rollout status sts pcs-mongo --timeout 10m
+      kubectl -n ${NS} rollout status sts pcs-mongo --timeout 10m|sed 's/^/|   |   |   |-- /g'
+      echo "|   |   |   '-- MongoDB restarted"
+      sleep 5
+      echo "|   |   '-- Mongo DB upgraded to version 6"
+    else
+      echo "|   |   '-- Mongo DB version 6 image present in registry"
+    fi
+  fi
+}
+
+#### #### #### #### #### #### #### ####
+#### #### #### #### #### #### #### ####
+#### #### #### #### #### #### #### ####
+usage_info () {
+	echo "  Usage: $0 <action> [<params>]"
+	echo "  * $0 scale-down [all]"
+	echo "  * $0 scale-up"
+	echo "  * $0 scale-show"
+	echo "  * $0 dr-restart"
+	echo "  * $0 backup [<parameters>]"
+  echo "  * $0 upgrade [<parameters>]"
+
+  echo "  Extra utilities:"
+	echo "  * $0 mongo-forward-on"
+	echo "  * $0 mongo-forward-off"
+	echo "  * $0 pgsql-forward-on"
+	echo "  * $0 pgsql-forward-off"
+	echo "  * $0 mongo-info"
+	echo "  * $0 pgsql-info"
+	echo "  * $0 elasticsearch-info"
+	echo "  * $0 watch"
+	echo "  * $0 sort-yaml <input.yaml> <output.yaml>"
+
+  echo "  DataRobot 10 utilities only:"
+  echo "  * $0 upgrade10 [<datarobot-app-dir> <datarobot-pcs-dir> [<version>] ]"
+	echo "  * $0 load-images [<datarobot-app-dir>] [<datarobot-pcs-dir>]"
+	echo "  * $0 push-images <ECR-PATH> | <ACR-PATH> | <GCR-PATH>"
+
+	echo "  For some examples execute:"
+	echo "  * $0 examples"
+	exit 1
+}
+
+#### #### #### #### #### #### #### ####
+usage_examples () {
+	echo
+	echo "Get help how to use $0 for backups"
+	echo "* $0 backup"
+	echo
+	echo "Backup all and place backup into '/opt/datarobot/backups' dir"
+	echo "* $0 backup all /opt/datarobot/backups"
+	echo
+	echo "Backup pgsql using pg_dump binary inside of pcs-postgresql-0"
+	echo "pod and put results into '/opt/datarobot/backups' directory"
+	echo "* $0 backup pgsql-internal /opt/datarobot/backups"
+	echo
+	echo "Scale DataRobot down:"
+	echo "* $0 scale-down"
+	echo
+	echo "Load images from './datarobot-app/' and './datarobot-pcs/'"
+	echo "directories to local docker"
+	echo "* $0 load-images datarobot_app datarobot_pcs"
+	echo
+	echo "Push local docker images to my ECR subdir 'dr10'"
+	echo "* $0 push-images push-images 29xxxxxx.dkr.ecr.us-east-1.amazonaws.com/dr10"
+	echo
+	echo "Generate lines to upgrade DataRobot using charts"
+	echo "from subdirectories 'datarobot-app/charts' and 'datarobot-pcs/charts'"
+	echo "* $0 upgrade10 datarobot_app datarobot_pcs"
+	echo
+	echo "Generate lines to upgrade DataRobot as in the previous example"
+	echo "but if subdirectories contain a few charts versions"
+	echo "and you want a particular version 10.1.0 used"
+	echo "* $0 upgrade10 datarobot_app datarobot_pcs 10.1.0"
+	echo
+	echo "Get PostgreSQL info"
+	echo "* $0 pgsql-info"
+	echo
+	echo "Create port forward to pod pcs-mongo-0:27017 so we can access"
+	echo "MongoDB going to localhost:27018"
+	echo "* $0 mongo-forward-on"
+	echo
+	echo "Watch DataRobot namespace pods stats and list of not ready pods"
+	echo "* $0 watch"
+	echo
+	echo "See DataRobot namespace pods stats and all not ready pods once"
+	echo "* $0 show"
+	echo
+	exit 1
+}
+
+#### #### #### #### #### #### #### ####
+yesno () {
+  echo "$?"
+}
+
+#### #### #### #### #### #### #### ####
+dr_upgrade () {
+  local PARAM1="$1"
+  #local PARAM2="$2"
+  #local PARAM3="$3"
+  local PROCEED=false
+  if [ -z "${PARAM1}" ] || ( [ "x${PARAM1}" != "xprepare" ] && [ "x${PARAM1}" != "xprocess" ] ); then
+    echo
+    echo "Upgrade from DataRobot versions 9/10/11 to version 11."
+    echo
+    echo "!!! Before performing an upgrade !!!"
+    echo "    - Scale DataRobot application down"
+    echo "    - Create DataRobot backup"
+    echo
+    echo "Upgrade is performed in the following steps:"
+    echo
+    echo "1. Prepare the upgrade"
+    echo "  $0 upgrade prepare"
+    echo "  - this step generates values.yaml, but only if it does not exist"
+    echo "  - this step generates example.yaml from a default template"
+    echo
+    echo "2. Edit the created values.yaml file, make sure it is correct"
+    echo "  vi values.yaml"
+    echo
+    echo "3. Proceed with the upgrade (changes are not reversible)"
+    echo "  $0 upgrade process"
+    echo
+    exit 1
+  fi
+  if [ "x${PARAM1}" = "xprocess" ]; then
+    PROCEED=true
+  fi
+  #
+  local NS=${DR_CORE_NAMESPACE}
+  local PRIME=$(ls -1 datarobot-prime-*.tgz 2>/dev/null|sort|tail -1)
+  local OUT=''
+  [ -z "${PRIME}" ] && ERROR "File datarobot-prime-VERSION.tgz in the current directory not found"
+  [ -f "${PRIME}" ] || ERROR "File ${PRIME} does not exist"
+  local DR_UPGRADE_VERSION=$(echo "${PRIME}"|sed 's/^datarobot-prime-//g;s/\.tgz$//g')
+	[ -z "${DR_UPGRADE_VERSION}" ] && ERROR "Cannot detect DR_UPGRADE_VERSION" 
+  local K_VERSION=$(kubectl version 2>&1|grep 'Server Version'); [ -z "${K_VERSION}" ] && ERROR "Cannot get Kubernetes Server Version (kubectl version)"
+	local CLOUD="generic"
+  local TEMPLATE="datarobot-prime/override/minimal_datarobot-generic_minio_values.yaml"
+	if echo "${K_VERSION}"|grep '\-eks-' >/dev/null; then
+		CLOUD=aws
+    TEMPLATE="datarobot-prime/override/minimal_datarobot-aws_values.yaml"
+	elif echo "${K_VERSION}"|grep '\-gke' >/dev/null; then
+		CLOUD=google
+    TEMPLATE="datarobot-prime/override/minimal_datarobot-google_values.yaml"
+	elif az >/dev/null 2>&1; then
+		CLOUD=azure
+    TEMPLATE="datarobot-prime/override/minimal_datarobot-azure_values.yaml"
+	fi
+  if [ "$DR_CURRENT_VERSION" = "$DR_UPGRADE_VERSION" ]; then
+    echo ".-- DataRobot re-applying the same version ${DR_CURRENT_VERSION}"
+  elif [ "$(printf '%s\n%s\n' "$DR_CURRENT_VERSION" "$DR_UPGRADE_VERSION" | sort -V | head -n1)" = "$DR_UPGRADE_VERSION" ]; then
+    ERROR "Cannot downgrade DataRobot from ${DR_CURRENT_VERSION} to ${DR_UPGRADE_VERSION}"
+  else
+    echo ".-- DataRobot upgrade from ${DR_CURRENT_VERSION} to ${DR_UPGRADE_VERSION}"
+  fi
+  echo
+  echo "#### #### #### #### #### #### #### ####"
+  check_postgresql
+  echo "#### #### #### #### #### #### #### ####"
+  check_mongodb
+  echo "#### #### #### #### #### #### #### ####"
+  echo
+  echo ".-- DataRobot upgrade from ${DR_CURRENT_VERSION} to ${DR_UPGRADE_VERSION}"
+  for i in DR_CURRENT_VERSION DR_UPGRADE_VERSION PRIME K_VERSION CLOUD; do
+    echo "|-- ${i}: ${!i}"
+  done
+  if echo "${DR_CURRENT_VERSION}"|grep -E '^11' >/dev/null; then
+    #echo "DataRobot version 11 upgrade"
+    echo "|-- Preparation for versions 9 and 10 not required"
+    helm -n ${NS} get values ${DR_APP_HELM_RELEASE_NAME} > values_${DR_CURRENT_VERSION}.yaml || ERROR "Cannot get helm values"
+    echo "|-- Values file"
+    if [ -f values.yaml ]; then
+      echo "|   |-- values.yaml already exists, not rewriting"
+    else
+      cat values_${DR_CURRENT_VERSION}.yaml |grep -v "^\s*USER-SUPPLIED VALUES:" > values.yaml
+      echo "|   |-- values.yaml created from helm, must be reviewed !!!"
+    fi
+  else
+    echo "|-- Preparation for upgrade from DataRobot9/10 required"
+    echo "|-- Values file"
+    [ -z "${DR_PCS_HELM_RELEASE_NAME}" ] && DR_PCS_HELM_RELEASE_NAME=pcs
+    [ -z "${DR_APP_HELM_RELEASE_NAME}" ] && DR_APP_HELM_RELEASE_NAME=dr
+    helm -n ${NS} get values ${DR_PCS_HELM_RELEASE_NAME} > pcs.yaml || exit 1
+    helm -n ${NS} get values ${DR_APP_HELM_RELEASE_NAME} > datarobot-values.yaml || exit 1
+    if [ -f values.yaml ]; then
+      echo "|   |-- values.yaml already exists, not rewriting"
+    else
+      #cat datarobot-values.yaml |grep -v "^\s*USER-SUPPLIED VALUES:" > values.yaml
+      awk '/^[[:space:]]*#/ { if (in_global) print "# " $0; else print $0; next } /^(auth-token-customization|cns|prediction-server):/ { in_global=1; print "# " $0; next } /^[^[:space:]#]/ { if (in_global) in_global=0 } { if (in_global) print "# " $0; else print $0 }' datarobot-values.yaml|grep -v "^\s*USER-SUPPLIED VALUES:" >> values.yaml
+      echo >> values.yaml
+      echo "#### #### #### #### #### #### #### ####" >> values.yaml
+      echo >> values.yaml
+      #cat pcs.yaml|grep -v "^\s*USER-SUPPLIED VALUES:" >> values.yaml
+      awk '/^[[:space:]]*#/ { if (in_global) print "# " $0; else print $0; next } /^(global|services):/ { in_global=1; print "# " $0; next } /^[^[:space:]#]/ { if (in_global) in_global=0 } { if (in_global) print "# " $0; else print $0 }' pcs.yaml|grep -v "^\s*USER-SUPPLIED VALUES:" >> values.yaml
+      echo -e "\n#\npg-upgrade:\n  enabled: true\n#\n" >> values.yaml
+      echo "|   |-- values.yaml created from helm, must be fixed manually !!!"
+    fi
+  fi
+  echo "|   '-- Values file values.yaml to be reviewed and fixed !!!!!!!!!"
+  tar xfz ${PRIME} --strip-components=2 ${TEMPLATE} || ERROR "Cannot extract ${TEMPLATE} from ${PRIME}"
+  echo "|-- Extracted $(basename ${TEMPLATE}) from ${PRIME}"
+  mv $(basename ${TEMPLATE}) example_unsorted.yaml  || ERROR "Cannot rename $(basename ${TEMPLATE}) to example_unsorted.yaml"
+  echo "|   |-- renamed $(basename ${TEMPLATE}) to example_unsorted.yaml"
+  echo "|   |-- ordering lines inside of yaml example"
+  sort_yaml example_unsorted.yaml example.yaml|sed 's/^/|   |-- /g'
+  echo "|   |-- Updating example values..."
+  local VARS="
+LOGS_BUCKET:
+eks.amazonaws.com/role-arn:
+BATCH_SPARK_IMAGE_REPO:
+SPARK_BLOB_STORAGE:
+SPARK_CUSTOMER_IAM_ROLE:
+SPARK_CW_LOG_ENABLED:
+SPARK_CW_LOG_GROUP:
+SPARK_NETWORK_AWS_SECURITY_GROUPS:
+SPARK_NETWORK_AWS_SUBNET_IDS:
+aws_default_region:
+aws_region:
+CSP_SPARK_SAFER_CUSTOM_IMAGE_HOST:
+CSP_SPARK_SAFER_CUSTOM_IMAGE_REPO:
+IMAGE_BUILDER_CUSTOM_APPLICATION_REGISTRY_REPO:
+IMAGE_BUILDER_CUSTOM_MODELS_ENVIRONMENT_REGISTRY_REPO:
+IMAGE_BUILDER_CUSTOM_MODELS_REGISTRY_HOST:
+IMAGE_BUILDER_CUSTOM_MODELS_REGISTRY_REPO:
+IMAGE_BUILDER_EPHEMERAL_CUSTOM_MODELS_REGISTRY_REPO:
+admin_password:
+admin_username:
+datarobot_license:
+domain:
+S3_BUCKET:
+S3_HOST:
+S3_IS_SECURE:
+S3_PORT:
+S3_REGION:
+S3_SERVER_SIDE_ENCRYPTION:
+S3_VALIDATE_CERTS:
+imageRegistry:
+name:
+password:
+registry:
+username:
+azure.workload.identity/tenant-id:
+azure.workload.identity/tenant-id:
+DOCKERHUB_PASSWORD:
+DOCKERHUB_USERNAME:
+issuer:
+hostname:
+AZURE_CLIENT_ID:
+AZURE_RESOURCE_GROUP_NAME:
+AZURE_SUBSCRIPTION_ID:
+AZURE_WORKSPACE_HOST:
+SPARK_BLOB_STORAGE:
+  "
+  local VAR=""
+  sed -i -E "s|^([[:space:]]*)name: DATAROBOT_SERVICE_ACCOUNT[[:space:]]*.*$|\1nameTEMP: DATAROBOT_SERVICE_ACCOUNT|" example.yaml
+  for i in ${VARS}; do
+    VAR=$(grep -E "^[[:space:]]*${i}" values.yaml |head -1|sed -E "s|^[[:space:]]*${i}[[:space:]]*(.*)[[:space:]]*$|\1|")
+    if [ -n "${VAR}" ]; then
+      sed -i -E "s|^([[:space:]]*${i})[[:space:]]*.*$|\1 ${VAR}|" example.yaml
+      echo "|   |   |-- $i [${VAR}]"
+    fi
+  done
+  sed -i -E "s|^([[:space:]]*)nameTEMP: DATAROBOT_SERVICE_ACCOUNT[[:space:]]*.*$|\1name: datarobot-s3|" example.yaml
+  echo "|   |   '-- Updating example values... done"
+  echo "|   '-- yaml example created"
+
+  awk '/^[^[:space:]]/ { current_section=$1; gsub(":", "", current_section) } current_section=="core" && /^[[:space:]]*config_env_vars:/ { flag=1; next } flag { if ($0 ~ /^ {4}/) print; else flag=0 } ' values.yaml |sort -u > options_values.txt
+  awk '/^[^[:space:]]/ { current_section=$1; gsub(":", "", current_section) } current_section=="core" && /^[[:space:]]*config_env_vars:/ { flag=1; next } flag { if ($0 ~ /^ {4}/) print; else flag=0 } ' example.yaml|sort -u > options_example.txt
+  cat options_example.txt options_values.txt |sort|uniq|grep -v '^\s*S3_' > options_combined.txt
+  awk -v newfile="options_combined.txt" '
+  BEGIN { while ((getline line < newfile) > 0) { new_lines[++n] = line } close(newfile) }
+  /^[^[:space:]]/ { current_section=$1; gsub(":", "", current_section) }
+  current_section=="core" && /^[[:space:]]*config_env_vars:/ { print; for (i=1;i<=n;i++) print "" new_lines[i]; flag=1; next }
+  flag && /^ {4}/ { next }
+  flag && !/^ {4}/ { flag=0 }
+  { print }
+' example.yaml > example_new.yaml && mv -f example_new.yaml example.yaml
+
+  if ! echo "${DR_CURRENT_VERSION}"|grep -E '^11' >/dev/null; then
+    echo "|-- MongoDB version check"
+    mongodb_version check
+    echo "|   '-- MongoDB version check"
+  fi
+  if ! ${PROCEED}; then
+    echo "|"
+    echo "|-- Next steps:"
+    echo "|   |-- 1. Please work on values.yaml file !!!!!!!!"
+    echo "|   |   |-- you can compare per line values with example values executing"
+    echo "|   |   '-- sdiff values.yaml example.yaml|more"
+    echo "|   '-- 2. Run the upgrade executing       !!!!!!!!"
+    echo "|       '-- $0 upgrade process"
+    echo "'-- Preparation completed"
+    exit 0
+  fi
+  PROCEED=false
+  echo -n "|-- Please confirm you want to proceed with the upgrade (y/N): "
+  read OUT
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^y$' >/dev/null && PROCEED=true
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^yes$' >/dev/null && PROCEED=true
+  if ! ${PROCEED}; then
+    echo "'-- Upgrade not confirmed, stopping."
+    exit 1
+  fi
+
+  #### scale postgresql to 1 replica
+  OUT=$(kubectl -n ${NS} scale sts pcs-postgresql --replicas=1) || ERROR "Cannot scale pcs-postgresql to 1 replica"
+  echo "|-- sts pcs-postgresql scaled to 1 replica"
+  ####
+  #### #### #### #### #### #### #### ####
+  # DR 9/10 preparation
+  # vvvvvvvvvvvvvvvvvvv
+  #### #### #### #### #### #### #### ####
+  if ! echo "${DR_CURRENT_VERSION}"|grep -E '^11' >/dev/null; then
+    echo "|-- Preparation for 9/10 to 11 upgrade"
+    # removing parameter wal_keep_segments from cm pcs-postgresql-configuration
+    if kubectl -n ${NS} get cm|grep pcs-postgresql-configuration >/dev/null; then
+      echo "|   |-- configmap pcs-postgresql-configuration found"
+        if kubectl -n ${NS} get cm pcs-postgresql-configuration -o yaml|grep wal_keep_segments >/dev/null; then
+          echo "|   |   |-- Parameter wal_keep_segments in configmap pcs-postgresql-configuration found"
+          kubectl -n ${NS} get cm pcs-postgresql-configuration -o yaml | sed '/wal_keep_segments/d' | kubectl apply -f - || ERROR "cannot patch configmap pcs-postgresql-configuration to exclude option /wal_keep_segments/d"
+          echo "|   |   |-- Parameter wal_keep_segments removed from configmap pcs-postgresql-configuration"
+          echo "|   |   '-- Restarting sts pcs-postgresql"
+          kubectl -n ${NS} rollout restart sts pcs-postgresql
+          kubectl -n ${NS} rollout status  sts pcs-postgresql
+        fi
+    fi
+    # removing arbiter
+    if kubectl -n "${NS}" exec -it pcs-mongo-0 -- bash -c "mongosh -u \${MONGODB_ROOT_USER} -p \${MONGODB_ROOT_PASSWORD} --quiet --eval 'rs.status().members.forEach(m => print(m.name))'"|grep pcs-mongo-arbiter >/dev/null; then
+      local ARBITER=$(kubectl -n "${NS}" exec -it pcs-mongo-0 -- bash -c "mongosh -u \${MONGODB_ROOT_USER} -p \${MONGODB_ROOT_PASSWORD} --quiet --eval 'rs.status().members.forEach(m => print(m.name))'"|grep pcs-mongo-arbiter|sed 's/\r//g')
+      echo "|   |-- pcs-mongo-arbiter found to be removed: ${ARBITER}"
+      # removing arbiter
+      kubectl -n ${NS} exec -it pcs-mongo-0 -- bash -c "echo \"rs.remove('${ARBITER}');\"|mongosh admin -u \${MONGODB_ROOT_USER} -p \${MONGODB_ROOT_PASSWORD} --authenticationDatabase admin" >/dev/null 2>/dev/null
+      if kubectl -n "${NS}" exec -it pcs-mongo-0 -- bash -c "mongosh -u \${MONGODB_ROOT_USER} -p \${MONGODB_ROOT_PASSWORD} --quiet --eval 'rs.status().members.forEach(m => print(m.name))'"|grep pcs-mongo-arbiter >/dev/null; then
+        echo "|   |   '-- pcs-mongo-arbiter removal error"
+        #exit 1
+      else
+         echo "|   |   '-- pcs-mongo-arbiter removed"
+      fi
+      else
+        echo "|   |-- no pcs-mongo-arbiter found"
+    fi
+
+    #### #### #### #### #### #### #### ####
+    # MongoDB version check/upgrade
+    mongodb_version process
+
+    #### #### #### #### #### #### #### ####
+    # MongoDB featureCompatibilityVersion check
+    mongodb_compatibility
+
+    #### #### #### #### #### #### #### ####
+    # PASSWORD LENGTH
+    password_legth_fix
+
+    #### #### #### #### #### #### #### ####
+    # CRDs labels and annotations
+    do_crds
+
+    #### #### #### #### #### #### #### ####
+    # Postgresql: deleting 2 functions and aggregate
+    do_postgresql_delete_resources
+    
+    #### #### #### #### #### #### #### ####
+    # Scale DR helm release down
+    #### #### #### #### #### #### #### ####
+    echo "|   |-- Scaling Dr Release down"
+    kubectl scale statefulset -l app.kubernetes.io/instance=dr --replicas=0 -n $NS |sed 's/^/|   |   |-- /'
+    kubectl scale deployment -l app.kubernetes.io/instance=dr --replicas=0 -n $NS |sed 's/^/|   |   |-- /'
+    echo "|   |   '-- Scaling Dr Release down"
+    #
+    #### #### #### #### #### #### #### ####
+    # power OFF PCS
+    #### #### #### #### #### #### #### ####
+    echo "|   |-- Powering Off PCS"
+    kubectl scale statefulset -l app.kubernetes.io/instance=pcs --replicas=0 -n $NS 2>&1 |sed 's/^/|   |   |-- /'
+    kubectl scale deployment -l app.kubernetes.io/instance=pcs --replicas=0 -n $NS 2>&1 |sed 's/^/|   |   |-- /'
+    echo "|   |   '-- Powering Off PCS"
+    #
+    #### #### #### #### #### #### #### ####
+    # change labels from PCS to DR
+    #### #### #### #### #### #### #### ####
+    echo "|   |-- Changing labels from PCS to DR"
+    for kind in secret pvc networkpolicy serviceaccount configmap service role rolebinding pdb; do
+      for sts in $(kubectl get $kind -l app.kubernetes.io/instance=pcs -n $NS -o jsonpath='{.items[*].metadata.name}'); do
+        echo "|   |   |-- retag $kind/$sts"
+        kubectl label $kind $sts app.kubernetes.io/instance=dr -n $NS --overwrite |sed 's/^/|   |   |   |-- /g' || exit 1
+        kubectl annotate $kind $sts meta.helm.sh/release-name=dr -n $NS --overwrite |sed "s/^/|   |   |   '-- /g" || exit 1
+      done
+    done
+    echo "|   |   '-- Changing labels from PCS to DR"
+    #
+    #### #### #### #### #### #### #### ####
+    # Preserver PV: change policies to retain
+    #### #### #### #### #### #### #### ####
+    echo "|   |-- Changing PVs policy from Delete to Retain"
+    kubectl get pvc -n $NS -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | while read pvc; do
+      pv=$(kubectl get pvc $pvc -n $NS -o jsonpath='{.spec.volumeName}') || exit 1
+      reclaimPolicy=$(kubectl get pv $pv -o jsonpath='{.spec.persistentVolumeReclaimPolicy}') || exit 1
+      if [[ $pvc == *"pcs"* ]]; then
+        echo "|   |   |-- PVC: $pvc, PV: $pv, Reclaim Policy: $reclaimPolicy"
+        if [[ $reclaimPolicy != "Retain" ]]; then
+          kubectl patch pv $pv -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' |sed 's/^/|   |   |   |-- /g' || exit 1
+          echo "|   |   |   '-- patch PV: $pv to Retain"
+        fi
+      fi
+    done
+    echo "|   |   '-- Changing PVs policy from Delete to Retain"
+    #
+    #### #### #### #### #### #### #### ####
+    # Delete PCS secrets
+    #### #### #### #### #### #### #### ####
+    echo "|   |-- Deleting PCS secrets"
+    for sec in pcs-db-buildservice pcs-db-cspspark pcs-db-identityresourceservice pcs-db-messagequeue pcs-db-modmon pcs-db-predenv pcs-db-sushihydra pcs-pgpool pcs-pgpool-custom-users pcs-pgppol-userdb pcs-postgresql-initdb pcs-postgresql-initdb-cfg pcs-redis; do
+      kubectl delete secret $sec -n $NS >/dev/null 2>&1
+      echo "|   |   |-- $sec"
+    done
+    echo "|   |   '-- Deleting PCS secrets"
+    #
+    #### #### #### #### #### #### #### ####
+    # Delete STSs
+    #### #### #### #### #### #### #### ####
+    echo "|   |-- Deleting PCS statefulsets and deployments"
+    kubectl -n ${NS} delete statefulset -l app.kubernetes.io/instance=pcs |sed 's/^/|   |   |-- /g'
+    kubectl -n ${NS} delete deployment -l app.kubernetes.io/instance=pcs |sed 's/^/|   |   |-- /g'
+    echo "|   |   '-- Deleting PCS statefulsets and deployments"
+    #
+    echo "|   '-- Preparation for 9/10 to 11 upgrade"
+  fi
+  #### #### #### #### #### #### #### ####
+  # ^^^^^^^^^^^^^^^^^^^
+  # DR 9/10 preparation
+  #### #### #### #### #### #### #### ####
+
+
+  #### #### #### #### #### #### #### ####
+  # Pre-upgrade
+  #### #### #### #### #### #### #### ####
+  #
+  #### #### #### #### #### #### #### ####
+  # reset rabbitmq
+  #### #### #### #### #### #### #### ####
+  echo -n "|-- Do you want to reset RabbitMQ data: yes/Skip (y/s) : "
+  read OUT
+  local RESET=false
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^y$' >/dev/null && RESET=true
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^yes$' >/dev/null && RESET=true
+  if ${RESET}; then
+    kubectl -n ${NS} scale sts pcs-rabbitmq --replicas=0 >/dev/null 2>&1
+    sleep 5
+    kubectl -n ${NS} delete sts pcs-rabbitmq >/dev/null 2>&1
+    sleep 5
+    kubectl -n ${NS} delete pvc data-pcs-rabbitmq-0 |sed 's/^/|   |-- /g'
+    sleep 5
+    echo "|   '-- RabbitMQ PVC data-pcs-rabbitmq-0 deleted"
+  else
+    echo "|   '-- reset not confirmed, skipping."
+  fi
+  #### #### #### #### #### #### #### ####
+  # reset redis
+  #### #### #### #### #### #### #### ####
+  echo -n "|-- Do you want to reset Redis data: yes/Skip (y/s) : "
+  read OUT
+  local RESET=false
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^y$' >/dev/null && RESET=true
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^yes$' >/dev/null && RESET=true
+  if ${RESET}; then
+    kubectl -n ${NS} scale sts pcs-redis-node --replicas=0 >/dev/null 2>&1
+    sleep 5
+    kubectl -n ${NS} delete sts pcs-redis-node >/dev/null 2>&1
+    sleep 5
+    kubectl -n ${NS} delete pvc redis-data-pcs-redis-node-0 |sed 's/^/|   |-- /g'
+    kubectl -n ${NS} delete pvc redis-data-pcs-redis-node-1 |sed 's/^/|   |-- /g'
+    kubectl -n ${NS} delete pvc redis-data-pcs-redis-node-2 |sed 's/^/|   |-- /g'
+    sleep 5
+    echo "|   '-- Redis PVCs redis-data-pcs-redis-node-[0/1/2] deleted"
+  else
+    echo "|   '-- reset not confirmed, skipping."
+  fi
+  #### #### #### #### #### #### #### ####
+  # reset ElasticSearch certificate
+  #### #### #### #### #### #### #### ####
+  echo -n "|-- Do you want to reset Elasticsearch certificate: yes/Skip (y/s) : "
+  read OUT
+  local RESET=false
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^y$' >/dev/null && RESET=true
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^yes$' >/dev/null && RESET=true
+  if ${RESET}; then
+    kubectl -n ${NS} delete secret pcs-elasticsearch-master-crt |sed 's/^/|   |-- /g'
+    echo "|   '-- Elasticsearch certificate pcs-elasticsearch-master-crt deleted"
+  else
+    echo "|   '-- reset not confirmed, skipping."
+  fi
+  #### #### #### #### #### #### #### ####
+  # Delete ingresses
+  #### #### #### #### #### #### #### ####
+  # kubectl -n ${NS} get ingress --no-headers |awk '{print $1}'|xargs kubectl -n ${NS} delete ingress
+  #### #### #### #### #### #### #### ####
+  PROCEED=false
+  echo -n "|-- Ready to apply the chart? (y/N): "
+  read OUT
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^y$' >/dev/null && PROCEED=true
+  echo "${OUT}"|tr 'A-Z' 'a-z'|grep '^yes$' >/dev/null && PROCEED=true
+  if ! ${PROCEED}; then
+    echo "'-- Upgrade not confirmed, stopping."
+    exit 1
+  fi
+  #### #### #### #### #### #### #### ####
+  echo "|-- Processing with the upgrade"
+  kubectl -n ${NS} delete sts tileservergl-app prediction-server-app --cascade=orphan >/dev/null 2>/dev/null
+  echo "|-- sts tileservergl-app deleted"
+  echo "|-- sts prediction-server-app deleted"
+  kubectl -n ${NS} delete deploy auth-server-hydra >/dev/null 2>/dev/null
+  echo "|-- deploy auth-server-hydra deleted"
+  if kubectl -n ${NS} get sts pcs-postgresql >/dev/null 2>&1; then
+    kubectl -n ${NS} scale sts pcs-postgresql --replicas=0 >/dev/null 2>&1
+    echo "|-- sts pcs-postgresql scaled to 0 replicas"
+  fi
+  if kubectl -n ${NS} get deploy pcs-pgpool >/dev/null 2>&1; then
+    kubectl -n ${NS} rollout restart deploy pcs-pgpool >/dev/null 2>&1
+    echo "|-- deployment pcs-pgpool restarted"
+  fi
+  #### #### #### #### #### #### #### ####
+  # Upgrade
+  #### #### #### #### #### #### #### ####
+  echo "|-- Applying helm chart, logs saved to helm-upgrade.log"
+  echo "|"
+  set -o pipefail
+  helm upgrade --install dr ${PRIME} -n ${NS} -f values.yaml --timeout 20m --debug 2>&1 |tee helm-upgrade.log |sed 's|^|\| |g'
+  local exit_code=${PIPESTATUS[0]}
+  echo "|"
+  echo "|-- Exit code: ${exit_code}"
+  echo "|-- helm upgrade command:"
+  echo "|   |-- helm upgrade --install dr ${PRIME} -n ${NS} -f values.yaml --timeout 20m --debug"
+  echo "|   '-- log file: helm-upgrade.log"
+  [[ ${exit_code} -eq 0 ]] || ERROR "helm upgrade failed"
+  #
+  #### #### #### #### #### #### #### ####
+  # Post-upgrade
+  #### #### #### #### #### #### #### ####
+  if ! echo "${DR_CURRENT_VERSION}"|grep -E '^11' >/dev/null; then
+    for secrets in $(kubectl get secret -l owner=helm -l name=pcs -n $NS -o jsonpath='{.items[*].metadata.name}'); do
+      kubectl delete secret $secrets -n $NS >/dev/null
+    done
+  fi
+  #### #### #### #### #### #### #### ####
+  echo "|-- Please do not forget to scale sts pcs-postgresql up if needed:"
+  echo "|   '-- kubectl -n ${NS} scale sts pcs-postgresql --replicas=3"
+  echo "'-- DataRobot upgrade from ${DR_CURRENT_VERSION} to ${DR_UPGRADE_VERSION}"
+  #### #### #### #### #### #### #### ####
+}
+
+#### #### #### #### #### #### #### ####
+dr_upgrade10 () {
+  if echo "${DR_CURRENT_VERSION}"|grep -E '^11' >/dev/null; then
+    echo "DataRobot version 11 upgrade not supported"
+    exit 11
+  fi
+	[ -n "$1" ] && DR_APP="$1"
+	[ -n "$2" ] && DR_PCS="$2"
+	DR_UPGRADE_VERSION=$(ls -1 ${DR_PCS}/charts/datarobot-pcs-ha-*.tgz|tail -1|sed 's/^.*-//g;s/\.tgz$//g')
+	[ -n "$3" ] && DR_UPGRADE_VERSION=$(echo "$3"|tr 'A-Z' 'a-z'|sed 's/^-*//g;s/[^0-9\.]//g')
+	[ -z "${DR_UPGRADE_VERSION}" ] && ERROR "wrong upgrade version ${1} specified" 
+	#
+	#### Get installation type
+	K_VERSION=$(kubectl version 2>&1|grep 'Server Version'); [ -z "${K_VERSION}" ] && ERROR "Cannot get Kubernetes Server Version (kubectl version)"
+	#CLOUD=azure; echo "${K_VERSION}"|grep '\-eks-' >/dev/null && CLOUD=aws; echo "${K_VERSION}"|grep '\-gke' >/dev/null && CLOUD=google;
+	CLOUD="generic"
+	if echo "${K_VERSION}"|grep '\-eks-' >/dev/null; then
+		CLOUD=aws
+	elif echo "${K_VERSION}"|grep '\-gke' >/dev/null; then
+		CLOUD=google
+	elif az >/dev/null 2>&1; then
+		CLOUD=azure
+	fi
+	#echo "CLOUD=[${CLOUD}]"
+	#
+	#### Check if we deal with cluster-admin or limited-admin version
+	SKIP_CRD=""
+	helm list -A --filter admin-privileges|grep admin-privileges >/dev/null && SKIP_CRD="--skip-crd"
+	#### Determine the current DataRobot version
+	ADMIN_PRIVS_RELEASE=$(helm -n default list|grep admin-privileges|awk '{print $1}')
+	[ -z "${ADMIN_PRIVS_RELEASE}" ] && ERROR "Cannot get admin-privs helm release name (helm -n default list|grep admin-privileges|awk '{print \$1}')"
+	####
+	local INGRESS_NS=$(kubectl get ns|grep ingress|awk '{print $1}'|xargs)
+	####
+	echo ".-- DataRobot upgrade from ${DR_CURRENT_VERSION} to ${DR_UPGRADE_VERSION}"
+	echo "|"
+	echo "|-- Files and directories"
+	echo "|   |-- ${DR_CORE_NAMESPACE} pcs directory: ${DR_PCS}"
+	echo "|   |   '-- pcs bundle file : ${DR_PCS}/charts/datarobot-pcs-ha-${DR_UPGRADE_VERSION}.tgz"
+	echo "|   '-- ${DR_CORE_NAMESPACE} dr directory : ${DR_APP}"
+	echo "|       |-- dr bundle file  : ${DR_APP}/charts/datarobot-${CLOUD}-${DR_UPGRADE_VERSION}.tgz"
+	echo "|       '-- admin-privs file: ${DR_APP}/charts/admin-privileges-${DR_UPGRADE_VERSION}.tgz"
+	#echo "|"
+	echo "|-- Helm charts"
+	echo "|   |-- pcs helm chart retrieved     : pcs-values1.yaml"
+	echo "|   |-- dr  helm chart retrieved     : datarobot-values1.yaml"
+	echo "|   '-- admin-privs chart created    : admin-privs-values.yaml"
+	#echo "|"
+	echo "'-- Helm charts for the upgrade"
+	echo "    |-- pcs helm chart to edit       : pcs-values2.yaml"
+	echo "    '-- dr  helm chart to edit       : datarobot-values2.yaml"
+	# prepare resources
+	if echo "${DR_CURRENT_VERSION}"|grep -E '^9|^10'; then
+	  helm get values -n ${DR_CORE_NAMESPACE} ${DR_PCS_HELM_RELEASE_NAME} > pcs-values1.yaml || ERROR "failed action: helm get values -n ${DR_CORE_NAMESPACE} ${DR_PCS_HELM_RELEASE_NAME} > pcs-values1.yaml"
+	  helm get values -n default ${ADMIN_PRIVS_RELEASE} > admin-privs-values.yaml || ERROR "faled action: helm get values -n default ${ADMIN_PRIVS_RELEASE} > admin-privs-values.yaml"
+  fi
+	helm get values -n ${DR_CORE_NAMESPACE} ${DR_APP_HELM_RELEASE_NAME}  > datarobot-values1.yaml || ERROR "failed action: helm get values -n ${DR_CORE_NAMESPACE} ${DR_APP_HELM_RELEASE_NAME}  > datarobot-values1.yaml"
+	#
+	local TMP=$(date +%Y%m%d-%H%M%S)
+	#
+	if [ -f pcs-values2.yaml ]; then
+		if diff pcs-values1.yaml pcs-values2.yaml >/dev/null; then
+			true # the same
+		else
+			cp -f pcs-values2.yaml pcs-values2-${TMP}.yaml
+			echo
+			echo "*-- Old pcs-values2.yaml copy saved as pcs-values2-${TMP}.yaml"
+		fi
+	fi
+	cp -f pcs-values1.yaml pcs-values2.yaml
+	#
+	if [ -f datarobot-values2.yaml ]; then
+		if diff datarobot-values1.yaml datarobot-values2.yaml >/dev/null; then
+			true # the same
+		else
+			cp -f datarobot-values2.yaml datarobot-values2-${TMP}.yaml
+			echo
+			echo "*-- Old datarobot-values2.yaml copy saved as datarobot-values2-${TMP}.yaml"
+			echo ""
+			echo "*-- You have a custom datarobot-values2.yaml"
+			echo "    You may want to copy datarobot-values1.yaml to datarobot-values2.yaml"
+			echo "    And edit it manually to make sure it corresponds to"
+			echo "    DataRobot ${DR_UPGRADE_VERSION} version requirements"
+		fi
+	else
+		cp -f datarobot-values1.yaml datarobot-values2.yaml
+	fi
+
+	[ -f pcs-values2.yaml ] && cp -f pcs-values2.yaml pcs-values2-${TMP}.yaml
+	cp -f pcs-values1.yaml pcs-values2.yaml
+	[ -f datarobot-values2.yaml ] && cp -f datarobot-values2.yaml datarobot-values2-${TMP}.yaml
+	[ -f datarobot-values2.yaml ] || cp -f datarobot-values1.yaml datarobot-values2.yaml
+	#cp -f datarobot-values1.yaml datarobot-values2.yaml
+	#
+	#pcs_rabbit_config "pcs-values2.yaml" "clustering:" "clustering:\n    forceBoot: true"
+	#pcs_rabbit_config "pcs-values2.yaml" "replicaCount:" "replicaCount: 3"
+	#pcs_rabbit_config "pcs-values2.yaml" "podManagementPolicy:\s*Parallel" "podManagementPolicy: Parallel"
+	#sed -i '/^databases:\s*$/,/^global:\s*$/c\global:' pcs-values2.yaml
+	#echo "'-- Helm charts"
+	#
+	#### Check existance of directories and DataRobot bundle files
+	[ -d ${DR_PCS} ] || ERROR "Directory not found: ${DR_PCS}"
+	[ -f ${DR_PCS}/charts/datarobot-pcs-ha-${DR_UPGRADE_VERSION}.tgz ] || ERROR "File not found: ${DR_PCS}/charts/datarobot-pcs-ha-${DR_UPGRADE_VERSION}.tgz"
+	[ -d ${DR_APP} ] || ERROR "Directory not found: ${DR_APP}"
+	[ -f ${DR_APP}/charts/datarobot-${CLOUD}-${DR_UPGRADE_VERSION}.tgz ] || ERROR "File not found: ${DR_APP}/charts/datarobot-${CLOUD}-${DR_UPGRADE_VERSION}.tgz"
+	[ -f ${DR_APP}/charts/admin-privileges-${DR_UPGRADE_VERSION}.tgz ] || ERROR "File not found: ${DR_APP}/charts/admin-privileges-${DR_UPGRADE_VERSION}.tgz"
+	#
+	#FULL_ACR_URL=$(cat datarobot-values1.yaml |grep '\s*registry:\s*'|head -1|awk '{print $2}');
+	#ACR_URL=${FULL_ACR_URL%/*}
+	#ACR=${FULL_ACR_URL%%.*}
+	#
+	echo
+	check_postgresql
+	echo
+	echo "#### #### #### #### #### #### #### #### #### #### #### #### #### #### ####"
+	echo "#### The following steps are commands to upgrade DataRobot, in the correct order:"
+	echo "####"
+	echo "#### !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo "#### Create datarobot-values2.yaml as copy of datarobot-values1.yaml"
+	echo "#### cp -f datarobot-values1.yaml datarobot-values2.yaml"
+	echo "#### and edit it to make sure it corresponds to DataRobot ${DR_UPGRADE_VERSION} requirements"
+	echo "#### !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo
+	#echo "ADMIN_PRIVS_RELEASE=\$(helm list|grep admin-privileges|awk '{print \$1}')"
+	echo "helm get values -n default ${ADMIN_PRIVS_RELEASE} > admin-privs-values.yaml"
+	echo helm upgrade  ${ADMIN_PRIVS_RELEASE} ${DR_APP}/charts/admin-privileges-${DR_UPGRADE_VERSION}.tgz -n default -f admin-privs-values.yaml
+	if echo ${DR_UPGRADE_VERSION}|grep -E '^9|^10.0|^10.1'; then
+		#tar xfz ${DR_APP}/charts/admin-privileges-${DR_UPGRADE_VERSION}.tgz || ERROR "Cannot untargzip ${DR_APP}/charts/admin-privileges-${DR_UPGRADE_VERSION}.tgz"
+		#[ -f admin-privileges/crds/notebooks.yaml ] || ERROR "File not found: admin-privileges/crds/notebooks.yaml"
+		#[ -f admin-privileges/crds/lrs.yaml ] || ERROR "File not found: admin-privileges/crds/lrs.yaml"
+		echo tar xfz ${DR_APP}/charts/admin-privileges-${DR_UPGRADE_VERSION}.tgz
+		echo kubectl apply -f admin-privileges/crds/notebooks.yaml 
+		echo kubectl apply -f admin-privileges/crds/lrs.yaml
+		echo kubectl apply -f admin-privileges/crds/pred-environments.yaml
+	else
+    echo
+    # NOTEBOOKS
+    echo kubectl label crd/notebooks.notebook.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite
+    echo kubectl annotate crd/notebooks.notebook.datarobot.com meta.helm.sh/release-name=${DR_APP_HELM_RELEASE_NAME} --overwrite
+    echo kubectl annotate crd/notebooks.notebook.datarobot.com meta.helm.sh/release-namespace=${DR_CORE_NAMESPACE} --overwrite
+    echo kubectl label crd/notebookvolumes.notebook.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite
+    echo kubectl annotate crd/notebookvolumes.notebook.datarobot.com meta.helm.sh/release-name=${DR_APP_HELM_RELEASE_NAME} --overwrite
+    echo kubectl annotate crd/notebookvolumes.notebook.datarobot.com meta.helm.sh/release-namespace=${DR_CORE_NAMESPACE} --overwrite
+    echo kubectl label crd/notebookvolumesnapshots.notebook.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite
+    echo kubectl annotate crd/notebookvolumesnapshots.notebook.datarobot.com meta.helm.sh/release-name=${DR_APP_HELM_RELEASE_NAME} --overwrite
+    echo kubectl annotate crd/notebookvolumesnapshots.notebook.datarobot.com meta.helm.sh/release-namespace=${DR_CORE_NAMESPACE} --overwrite
+    # LRS
+    echo kubectl label crd/lrs.lrs.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite
+    echo kubectl annotate crd/lrs.lrs.datarobot.com meta.helm.sh/release-name=${DR_APP_HELM_RELEASE_NAME} --overwrite
+    echo kubectl annotate crd/lrs.lrs.datarobot.com meta.helm.sh/release-namespace=${DR_CORE_NAMESPACE} --overwrite
+    # CRD
+    echo kubectl label crd/executionenvironments.predictions.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite
+    echo kubectl annotate crd/executionenvironments.predictions.datarobot.com meta.helm.sh/release-name=${DR_APP_HELM_RELEASE_NAME} --overwrite
+    echo kubectl annotate crd/executionenvironments.predictions.datarobot.com meta.helm.sh/release-namespace=${DR_CORE_NAMESPACE} --overwrite
+    echo kubectl label crd/inferenceservers.predictions.datarobot.com app.kubernetes.io/managed-by=Helm --overwrite
+    echo kubectl annotate crd/inferenceservers.predictions.datarobot.com meta.helm.sh/release-name=${DR_APP_HELM_RELEASE_NAME} --overwrite
+    echo kubectl annotate crd/inferenceservers.predictions.datarobot.com meta.helm.sh/release-namespace=${DR_CORE_NAMESPACE} --overwrite
+    #
+    echo
+	fi
+	echo kubectl -n ${DR_CORE_NAMESPACE} delete sts pcs-rabbitmq --cascade=orphan
+	echo kubectl -n ${DR_CORE_NAMESPACE} scale sts/pcs-postgresql --replicas=1
+	echo "#### wait until all pods are up and running"
+	echo
+	echo helm upgrade ${DR_PCS_HELM_RELEASE_NAME} ${DR_PCS}/charts/datarobot-pcs-ha-${DR_UPGRADE_VERSION}.tgz -n ${DR_CORE_NAMESPACE} --values pcs-values2.yaml ${SKIP_CRD} --wait --debug
+	echo "#### check PostgreSQL cluster pods and fix if needed"
+        echo "#### wait until all pods are up and running"
+	echo
+	echo kubectl -n ${DR_CORE_NAMESPACE} rollout restart sts/pcs-rabbitmq
+	echo "#### wait until all restarted pods are up and running"
+	echo
+	echo kubectl -n ${DR_CORE_NAMESPACE} delete sts tileservergl-app prediction-server-app --cascade=orphan
+	echo helm upgrade ${DR_APP_HELM_RELEASE_NAME} ${DR_APP}/charts/datarobot-${CLOUD}-${DR_UPGRADE_VERSION}.tgz -n ${DR_CORE_NAMESPACE} --values datarobot-values2.yaml ${SKIP_CRD} --timeout 15m --debug
+	echo "#### wait until all pods are up and running"
+	echo
+	echo kubectl -n ${DR_CORE_NAMESPACE} rollout restart sts/tileservergl-app
+	echo kubectl -n ${DR_CORE_NAMESPACE} rollout restart sts/prediction-server-app
+	echo "#### wait until all restarted pods are up and running"
+	echo
+	echo kubectl -n ${DR_CORE_NAMESPACE} rollout restart deploy
+	echo "#### wait until all restarted pods are up and running"
+	echo
+	if [ -n "${INGRESS_NS}" ]; then
+		echo "#### You may want restart ingress deployments"
+		for i in ${INGRESS_NS}; do
+			echo "kubectl -n $i rollout restart deploy"
+		done
+		echo "#### wait until all ingress pods are up and running"
+		echo
+	fi
+	echo "kubectl -n ${DR_CORE_NAMESPACE} exec -it deployment.apps/mmapp-app -- bash -c 'sbin/datarobot-manage-queue recover-jobs'"
+	echo
+}
+
+#### #### #### #### #### #### #### ####
+scale_down () {
+        #
+        # Scale down
+        #
+  local STS=false
+  echo "$1"|tr 'A-Z' 'a-z'|grep '^all$' >/dev/null && STS=true
+  echo
+	echo ".-- DataRobot scaling down"
+  echo "|-- Annotate deployments in namespace ${DR_CORE_NAMESPACE}:"
+  for i in $(kubectl -n ${DR_CORE_NAMESPACE} get deploy -o name); do
+  #for i in $(kubectl -n ${DR_CORE_NAMESPACE} get deploy -o name -l release=${DR_APP_HELM_RELEASE_NAME}) deployment.apps/pcs-pgpool; do
+    local REPLICAS=$(kubectl -n ${DR_CORE_NAMESPACE} get ${i} -o jsonpath='{.spec.replicas}' 2>&1)
+    [ -z "${REPLICAS}" ] && ERROR "Empty number of replicas received for ${i}"
+    if [ "x${REPLICAS}" == "x0" ]; then
+      echo "|   |-- 0 replicas received for $i, no need to annotate"
+    else
+      OUT=$(kubectl -n ${DR_CORE_NAMESPACE} annotate --overwrite ${i} replicas=${REPLICAS} 2>&1)
+      echo "|   |-- $i replicas ${REPLICAS} annotated"
+    fi
+  done
+  echo "|   '-- Annotate deployments in namespace ${DR_CORE_NAMESPACE}: Ok"
+  echo "|-- Scale down deployments in namespace ${DR_CORE_NAMESPACE} ..."
+  #kubectl -n ${DR_CORE_NAMESPACE} scale deploy -l release=${DR_APP_HELM_RELEASE_NAME} --replicas=0 2>&1
+  #kubectl -n ${DR_CORE_NAMESPACE} scale deploy pcs-pgpool --replicas=0 2>&1
+  kubectl -n ${DR_CORE_NAMESPACE} scale deploy --all --replicas=0 2>&1 |sed 's#^#|   |-- #g'
+  echo "|   '-- Scale down deployments in namespace ${DR_CORE_NAMESPACE}: Ok"
+  if ${STS}; then
+    echo "|-- Annotate statefulsets in namespace ${DR_CORE_NAMESPACE}:"
+    for i in $(kubectl -n ${DR_CORE_NAMESPACE} get sts -o name); do
+      local REPLICAS=$(kubectl -n ${DR_CORE_NAMESPACE} get ${i} -o jsonpath='{.spec.replicas}' 2>&1)
+      [ -z "${REPLICAS}" ] && ERROR "Empty number of replicas received for ${i}"
+      if [ "x${REPLICAS}" == "x0" ]; then
+        echo "|   |-- 0 replicas received for $i, no need to annotate"
+      else
+        OUT=$(kubectl -n ${DR_CORE_NAMESPACE} annotate --overwrite ${i} replicas=${REPLICAS} 2>&1)
+        echo "|   |-- $i replicas ${REPLICAS} annotated"
+      fi
+    done
+    echo "|   '-- Annotate statefulsets in namespace ${DR_CORE_NAMESPACE}: Ok"
+    echo "|-- Scale down statefulsets in namespace ${DR_CORE_NAMESPACE} ..."
+    kubectl -n ${DR_CORE_NAMESPACE} scale sts --all --replicas=0 2>&1 |sed 's#^#|   |-- #g'
+    echo "|   '-- Scale down statefulsets in namespace ${DR_CORE_NAMESPACE}: Ok"
+  fi
+	echo "'-- DataRobot scaling down"
+  echo
+}
+
+#### #### #### #### #### #### #### ####
+scale_up () {
+        #
+        # scale up
+        #
+  local STS=false
+  echo
+	echo ".-- DataRobot scaling up"
+  echo "|-- Scaling up statefulsets (restoring number of replicas):"
+  for i in $(kubectl -n ${DR_CORE_NAMESPACE} get sts -o name); do
+    local REPLICAS_CURRENT=$(kubectl -n ${DR_CORE_NAMESPACE} get ${i} -o jsonpath='{.spec.replicas}' 2>&1)
+    [ -z "${REPLICAS_CURRENT}" ] && ERROR "Empty number of replicas received for ${i}"
+    local REPLICAS=$(kubectl -n $DR_CORE_NAMESPACE get ${i} -o jsonpath='{.metadata.annotations.replicas}' 2>&1)
+    [ -z "${REPLICAS}" ] && [ "${REPLICAS_CURRENT}" = "0" ] && ERROR "${i} scaled to 0 replicas, but annotation is empty"
+    if [ -z "${REPLICAS}" ] || [ "x${REPLICAS}" = "x${REPLICAS_CURRENT}" ]; then
+      echo "|   |-- ${i} already scaled to ${REPLICAS_CURRENT} replicas"
+    else
+      STS=true
+      kubectl -n $DR_CORE_NAMESPACE scale ${i} --replicas=${REPLICAS} >/dev/null
+      echo "|   |-- replicas ${REPLICAS_CURRENT} -> ${REPLICAS} for ${i}"
+    fi
+  done
+  echo "|   '-- Scaling up statefulsets: Ok"
+  if ${STS}; then
+    echo "|-- Waiting for statefulsets to start"
+    for i in $(kubectl -n ${DR_CORE_NAMESPACE} get sts -o name|grep pcs-|tac); do
+      echo "|   |-- $i"
+      kubectl -n dr-app rollout status $i --timeout=8m | sed "s#^#|   |   |-- #g"
+      [ ${PIPESTATUS[0]} -eq 0 ] || ERROR "Cannot start $i in 8 minutes"
+      echo "|   |   '-- $i is up"
+    done
+    echo "|   '-- Waiting for statefulsets to start: OK"
+  fi
+  echo "|-- Scaling up deployments (restoring number of replicas):"
+  #for i in deployment.apps/pcs-pgpool $(kubectl -n ${DR_CORE_NAMESPACE} get deploy -o name -l release=${DR_APP_HELM_RELEASE_NAME}); do
+  for i in $(kubectl -n ${DR_CORE_NAMESPACE} get deploy -o name); do
+    local REPLICAS_CURRENT=$(kubectl -n ${DR_CORE_NAMESPACE} get ${i} -o jsonpath='{.spec.replicas}' 2>&1)
+    [ -z "${REPLICAS_CURRENT}" ] && ERROR "Empty number of replicas received for ${i}"
+    local REPLICAS=$(kubectl -n $DR_CORE_NAMESPACE get ${i} -o jsonpath='{.metadata.annotations.replicas}' 2>&1)
+    [ -z "${REPLICAS}" ] && ERROR "Empty number of replicas received for ${i}"
+    if [ "x${REPLICAS}" = "x${REPLICAS_CURRENT}" ]; then
+      echo "|   |-- ${i} already scaled to ${REPLICAS} replicas"
+    else
+      kubectl -n $DR_CORE_NAMESPACE scale ${i} --replicas=${REPLICAS} >/dev/null
+      #kubectl -n $DR_CORE_NAMESPACE annotate ${i} replicas- >/dev/null
+      echo "|   |-- replicas ${REPLICAS_CURRENT} -> ${REPLICAS} for ${i}"
+    fi
+  done
+  echo "|   '-- Scaling up deployments: Ok"
+  kubectl -n ${DR_CORE_NAMESPACE} get po|grep -v Running|grep -v Completed|grep -E 'CrashLoopBackOff|Error|StatusUnknown'|awk '{print $1}'|xargs kubectl -n ${DR_CORE_NAMESPACE} delete po --wait=false >/dev/null 2>&1
+	echo "'-- DataRobot scaling up"
+  echo
+  return 0
+}
+#### #### #### #### #### #### #### ####
+scale_show () {
+        #for i in $(kubectl -n ${DR_CORE_NAMESPACE} get deploy -o name -l release=${DR_APP_HELM_RELEASE_NAME}) deployment.apps/pcs-pgpool; do echo "$i $(kubectl -n ${DR_CORE_NAMESPACE} get ${i} -o jsonpath='{.spec.replicas}')"; done
+        #for i in $(kubectl -n ${DR_CORE_NAMESPACE} get deploy -o name); do echo "$i $(kubectl -n ${DR_CORE_NAMESPACE} get ${i} -o jsonpath='{.spec.replicas}')"; done
+        #for i in $(kubectl -n ${DR_CORE_NAMESPACE} get sts -o name); do echo "$i $(kubectl -n ${DR_CORE_NAMESPACE} get ${i} -o jsonpath='{.spec.replicas}')"; done
+        echo ".-- DataRobot resources status:"
+        echo "|"
+        echo "|-- Deployments"
+        kubectl -n ${DR_CORE_NAMESPACE} get deploy|sed 's#^#|   |-- #g'| sed '$s/\(.*\)|/\1'\''/'
+        #echo "|   '"
+        #echo "|   '-- Deployments"
+        echo "|"
+        echo "|-- Statefulsets:"
+        kubectl -n ${DR_CORE_NAMESPACE} get sts|sed 's#^#|   |-- #g'| sed '$s/\(.*\)|/\1'\''/'
+        #echo "|   '"
+        #echo "|   '-- Statefulsets"
+        echo "|"
+        echo "'-- DataRobot resources status"
+}
+
+#### #### #### #### #### #### #### ####
+dr_restart () {
+        echo ".-- Restarting deployment apps:"
+        #kubectl -n ${DR_CORE_NAMESPACE} rollout restart deploy
+        for i in $(kubectl get deploy -n ${DR_CORE_NAMESPACE}|tail -n +2|awk '{print $1}'); do
+                SYSTEM "kubectl rollout restart -n ${DR_CORE_NAMESPACE} deployment/$i;"
+                echo "|   |-- $i: restarted"
+        done
+        echo "'   '-- Restarting deployment apps"
+}
+
+#### #### #### #### #### #### #### ####
+k_line () {
+	K_LINE='
+        ALL=$(kubectl -n '${DR_CORE_NAMESPACE}' get pod 2>&1|grep -v "No resources found in '${DR_CORE_NAMESPACE}' namespace.");
+        N_ALL=$(echo "${ALL}"|grep -v "^NAME "|wc -l);
+        [ -z "${ALL}" ] && N_ALL=0
+        N_GOOD=$(echo "${ALL}"|grep -E " [1-9]/[0-9][0-9]* *Running | 0/[0-9][0-9]* *Completed "|grep -v "^NAME "|wc -l);
+        N_BAD=$((${N_ALL}-${N_GOOD}))
+        #N_BAD=$(echo "${ALL}"|grep -vE " [1-9]/[0-9][0-9]* *Running | 0/[0-9][0-9]* *Completed "|grep -v "^NAME "|wc -l);
+        echo "Watching list of not ready pods (all ${N_ALL}, good ${N_GOOD}, not-ready ${N_BAD}):"
+        echo "${ALL}"|grep -vE " [1-9]/[0-9][0-9]* *Running | 0/[0-9][0-9]* *Completed "
+'
+}
+myshow () {
+	k_line
+        bash -c "${K_LINE}"
+}
+mywatch () {
+        watch --help >/dev/null 2>&1 || ERROR "command watch not found"
+	k_line
+        watch -t "${K_LINE}"
+        myshow
+}
+
+#### #### #### #### #### #### #### ####
+system_check () {
+	check_tool kubectl
+	check_tool helm
+	check_tool base64
+	helm list >/dev/null || ERROR "executing helm list"
+  DR_CURRENT_VERSION=$(helm list -A --all|grep datarobot-|grep -v datarobot-pcs-|awk '{print $NF}'|sed 's/\-.*//g') || ERROR "Failed command: helm list -A"
+	[ -z "${DR_CURRENT_VERSION}" ] && ERROR "Cannot get current DR version: helm list -A|grep datarobot-|grep -v datarobot-pcs-"
+	DR_CORE_NAMESPACE=$(helm list -A --all|grep datarobot-|head -1|awk '{print $2}')
+	[ -z "${DR_CORE_NAMESPACE}" ] && ERROR "Cannot find namespace executing 'helm list -A|grep datarobot-'"
+	kubectl -n ${DR_CORE_NAMESPACE} get pod >/dev/null || ERROR "executing kubectl get pods"
+	[ -z "${DR_CORE_NAMESPACE}" ] && ERROR "DR_CORE_NAMESPACE is empty"
+	DR_APP_HELM_RELEASE_NAME=$(helm list -A --all|grep datarobot-|grep -v datarobot-pcs|awk '{print $1}')
+  if echo "${DR_CURRENT_VERSION}"|grep -E '^9|^10' >/dev/null; then
+	  DR_PCS_HELM_RELEASE_NAME=$(helm list -A --all|grep datarobot-|grep    datarobot-pcs|awk '{print $1}')
+  fi
+	#if [ "x${ACTION}" != "xwatch" ] && \
+	#	[ "x${ACTION}" != "xshow" ] && \
+	#	[ "x${ACTION}" != "xload-images" ] && [ "x${ACTION}" != "xload" ] && \
+	#	[ "x${ACTION}" != "xpush-images" ] && [ "x${ACTION}" != "xpush" ]; then
+
+	if [ "x${ACTION}" = "xbackup" ] || \
+		[ "x${ACTION}" = "xupgrade" ] || \
+		[ "x${ACTION}" = "xscale-up" ] || \
+		[ "x${ACTION}" = "xscale-down" ] || \
+		[ "x${ACTION}" = "xscale-show" ]; then
+		[ -z "${DR_APP_HELM_RELEASE_NAME}" ] && ERROR "DR_APP_HELM_RELEASE_NAME is empty"
+    if echo "${DR_CURRENT_VERSION}"|grep -E '^9|^10' >/dev/null; then
+		  [ -z "${DR_PCS_HELM_RELEASE_NAME}" ] && ERROR "DR_PCS_HELM_RELEASE_NAME is empty"
+    fi
+	fi
+}
+
+#### #### #### #### #### #### #### ####
+backup_values () {
+	local BACKUP_DIR="$1"
+	[ -d "${BACKUP_DIR}" ] || ERROR "backup directory ${BACKUP_DIR} does not exist"
+	mkdir -p "${BACKUP_DIR}/secrets"
+        echo "|-- Values backups:"
+        SYSTEM "helm get values ${DR_APP_HELM_RELEASE_NAME}  -n ${DR_CORE_NAMESPACE} > ${BACKUP_DIR}/datarobot-values.yaml"
+        echo "|   |-- chart ${DR_APP_HELM_RELEASE_NAME}  values backup  datarobot-values.yaml: Ok"
+        if echo "${DR_CURRENT_VERSION}"|grep -E '^9|^10'; then
+          SYSTEM "helm get values ${DR_PCS_HELM_RELEASE_NAME} -n ${DR_CORE_NAMESPACE} > ${BACKUP_DIR}/pcs-values.yaml"
+          echo "|   |-- chart ${DR_PCS_HELM_RELEASE_NAME} values backup pcs-values.yaml: Ok"
+        fi
+        SYSTEM "kubectl -n ${DR_CORE_NAMESPACE} get secret/core-credentials -o jsonpath='{.data.asymmetrickey}' | base64 -d > ${BACKUP_DIR}/secrets/ASYMMETRIC_KEY_PAIR_MONGO_ENCRYPTION_KEY.txt"
+        echo "|   |-- ${BACKUP_DIR}/secrets/ASYMMETRIC_KEY_PAIR_MONGO_ENCRYPTION_KEY.txt: Ok"
+        SYSTEM "kubectl -n ${DR_CORE_NAMESPACE} get secret/core-credentials -o jsonpath='{.data.drsecurekey}' | base64 -d > ${BACKUP_DIR}/secrets/DRSECURE_MONGO_ENCRYPTION_KEY.txt"
+        echo "|   |-- ${BACKUP_DIR}/secrets/DRSECURE_MONGO_ENCRYPTION_KEY.txt: Ok"
+        #echo "|   |-- getting secrets for ${DR_PCS_HELM_RELEASE_NAME} instances:"
+        #if echo "${DR_CURRENT_VERSION}"|grep -E '^9|^10'; then
+        #  SYSTEM "kubectl -n ${DR_CORE_NAMESPACE} get secrets -l app.kubernetes.io/instance=pcs -o name"
+        #else
+        #  SYSTEM "kubectl -n ${DR_CORE_NAMESPACE} get secrets -l app.kubernetes.io/instance=dr -o name"
+        #fi
+        SYSTEM "kubectl -n ${DR_CORE_NAMESPACE} get secrets -o name"
+        local SECRETS="${SYSTEM_OUTPUT}"
+        for i in ${SECRETS}; do
+                echo "|   |-- $i"
+                SYSTEM "kubectl -n '${DR_CORE_NAMESPACE}' get '${i}' -o json | jq '{data}' > '${BACKUP_DIR}/secrets/${i#*/}.json'"
+                echo "|   |   |-- ${BACKUP_DIR}/secrets/${i#*/}.json"
+                SYSTEM "kubectl -n '${DR_CORE_NAMESPACE}' get '${i}' -o yaml > '${BACKUP_DIR}/secrets/${i#*/}.yaml'"
+                echo "|   |   '-- ${BACKUP_DIR}/secrets/${i#*/}.yaml"
+        done
+        #echo "|   |   '-- getting secrets for ${DR_PCS_HELM_RELEASE_NAME} instances: Ok"
+        if cat ${BACKUP_DIR}/datarobot-values.yaml|grep certs >/dev/null; then
+                echo "|   |-- It looks like there are certs to be backed up"
+                echo "|   |   YOU HAVE TO DO IT MANUALLY !!!"
+                echo "|   |   Example commands:"
+                for i in $(cat ${BACKUP_DIR}/datarobot-values.yaml |grep '^\s*- secret: '|awk '{print $3}'); do
+                        echo "|   |   |-- kubectl -n ${DR_CORE_NAMESPACE} get secret ${i} -o jsonpath='{.data.*}' > ${BACKUP_DIR}/secrets/certs/${i}.crt"
+                done
+                echo "|   |   '--   Example commands"
+        fi
+        echo "|   '-- Values backups: Ok"
+}
+
+#### #### #### #### #### #### #### ####
+backup_mongo_external () {
+	local BACKUP_DIR="$1"
+        [ -d "${BACKUP_DIR}" ] || ERROR "backup directory ${BACKUP_DIR} does not exist"
+	local LOG="${BACKUP_DIR}/mongodb-backup.log"
+        local UU='pcs-mongodb'
+        if kubectl -n ${DR_CORE_NAMESPACE} get secret|grep "^pcs-mongo-username\s" >/dev/null; then
+                SYSTEM "kubectl -n ${DR_CORE_NAMESPACE} get secret pcs-mongo-username -o yaml"
+                UU=$(echo "${SYSTEM_OUTPUT}"|grep mongodb-root-username:|awk '{print $2}'|base64 -d)
+                [ -z "${UU}" ] && ERROR "MongoDB root username was not received (from pcs-mongo-username secret)"
+        fi
+        SYSTEM "kubectl -n ${DR_CORE_NAMESPACE} get secret pcs-mongo -o yaml"
+        local PP=$(echo "${SYSTEM_OUTPUT}"|grep mongodb-root-password:|awk '{print $2}'|base64 -d)
+        [ -z "${PP}" ] && ERROR "MongoDB ${UU} user passord was not received (from pcs-mongo secret)"
+	echo "|-- MongoDB backup ($(date +%Y-%m-%d_%H:%M:%S))"
+	echo "|   |-- Directory ${BACKUP_DIR}/mongodb"
+	echo "|   '-- Log file ${LOG}"
+	echo "|-- Starting backup ..."
+	[ -d ${BACKUP_DIR}/mongodb.prev ] && rm -rf ${BACKUP_DIR}/mongodb.prev
+	[ -d ${BACKUP_DIR}/mongodb ] && mv -f ${BACKUP_DIR}/mongodb ${BACKUP_DIR}/mongodb.prev
+	forward_finish mongo
+	forward_start mongo
+	echo "|   |-- mongodump -vv -u ${UU} -p ${PP} --port 27018 -o ${BACKUP_DIR}/mongodb"
+	mongodump -vv -u ${UU} -p ${PP} --port 27018 -o ${BACKUP_DIR}/mongodb > ${LOG} 2>&1
+	#mongodump -vv -u ${UU} -p ${PP} --port 27018 -o ${BACKUP_DIR}/mongodb 2>&1 |tee ${LOG} |sed 's#^#| #g'
+	echo "|   |-- Exit code $?"
+	forward_finish mongo
+	#ls -la ${LOG}|sed 's#^#| #g'
+	du -sh ${BACKUP_DIR}/mongodb|sed 's#\s\s*# #g;s#^#|   |-- Directory size: #g'
+	echo "|   |-- Log file ${LOG}"
+	echo "|   '-- MongoDB backup finished ($(date +%Y-%m-%d_%H:%M:%S))"
+}
+
+#### #### #### #### #### #### #### ####
+backup_mongo_internal () {
+	local BACKUP_DIR="$1"
+        [ -d "${BACKUP_DIR}" ] || ERROR "backup directory ${BACKUP_DIR} does not exist"
+	# backup MongoDB to /tmp/mongodb.tar inside of the pod
+	local LOG="${BACKUP_DIR}/mongodb-backup.log"
+	echo "|-- MongoDB backup-inside-of-a-pod ($(date +%Y-%m-%d_%H:%M:%S))"
+	echo "|   |-- Directory ${BACKUP_DIR}/mongodb"
+	echo "|   '-- Log file ${LOG}"
+	echo "|-- Starting backup inside of the pod pcs-mongo-0 ..."
+	kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-mongo-0 -- bash -c 'rm -rf /tmp/mongodb;mongodump -vv -u ${MONGODB_ROOT_USER} -p ${MONGODB_ROOT_PASSWORD} -o /tmp/mongodb && cd /tmp && tar cf mongodb.tar mongodb && echo && du -sh /tmp/mongodb && rm -rf /tmp/mongodb && ls -la mongodb.tar && echo "Exit code: $?"' > ${LOG} 2>&1 || ERROR "backup and tar creation exit code is not 0"
+	echo "|   |-- backup and tar creation exit code is 0"
+	echo "|   |-- copying pcs-mongo-0:/tmp/mongodb.tar to ${BACKUP_DIR}/mongodb.tar"
+	if OUT=$(kubectl -n ${DR_CORE_NAMESPACE} cp pcs-mongo-0:/tmp/mongodb.tar ${BACKUP_DIR}/mongodb.tar 2>&1); then
+    echo "|   |   '-- ${BACKUP_DIR}/mongodb.tar"
+  else
+    echo "${OUT}"
+    ERROR "ERROR: Cannot get mongodb.tar"
+  fi
+	kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-mongo-0 -- bash -c 'rm -f /tmp/mongodb.tar'
+	#ls -la ${LOG}|sed 's#^#| #g'
+	du -sh ${BACKUP_DIR}/mongodb.tar|sed 's#\s\s*# #g;s#^#|   |-- Backup size: #g'
+	echo "|   |-- Log file ${LOG}"
+	echo "|   '-- MongoDB backup-inside-of-a-pod finished ($(date +%Y-%m-%d_%H:%M:%S))"
+}
+
+#### #### #### #### #### #### #### ####
+backup_pgsql_external () {
+        local BACKUP_DIR="$1"
+        [ -d "${BACKUP_DIR}" ] || ERROR "backup directory ${BACKUP_DIR} does not exist"
+        local LOG="${BACKUP_DIR}/pgsql-backup.log"
+        local PGPASSWORD=$(kubectl -n ${DR_CORE_NAMESPACE} get secret pcs-postgresql -o yaml|grep postgres-password:|awk '{print $2}'|base64 -d)
+        [ -z "${PGPASSWORD}" ] && ERROR "postgresql password retrieved is empty"
+	echo "|-- PostgreSQL backup ($(date +%Y-%m-%d_%H:%M:%S))"
+        echo "|   |-- Directory ${BACKUP_DIR}/pgsql"
+        echo "|   '-- Log file ${LOG}"
+        #echo "|-- Starting backup ..."
+        #[ -d ${BACKUP_DIR}/pgsql.prev ] && rm -rf ${BACKUP_DIR}/pgsql.prev
+        #[ -d ${BACKUP_DIR}/pgsql ] && mv -f ${BACKUP_DIR}/pgsql ${BACKUP_DIR}/pgsql.prev && mkdir -p ${BACKUP_DIR}/pgsql
+	[ -d ${BACKUP_DIR}/pgsql ] && ERROR "Directory ${BACKUP_DIR}/pgsql already exists"
+	mkdir -p ${BACKUP_DIR}/pgsql
+	forward_finish pgsql
+	forward_start pgsql
+	export PGPASSWORD
+	local DBS=''
+	if DBS=$(psql -Upostgres -hlocalhost -p5433 -t -c "SELECT datname FROM pg_database;"); then
+		DBS=$(echo "${DBS}"|grep -vE "template|repmgr|postgres"| sed "s/\r//g"|xargs)
+	else
+		ERROR "Error retrieving list of DBs from PostgreSQL"
+	fi
+	echo "|-- List of DBs to backup: ${DBS}"
+	>${LOG}
+	#for i in $(psql -Upostgres -hlocalhost -p5433 -t -c "SELECT datname FROM pg_database;"| grep -vE "template|repmgr|postgres"| sed "s/\r//g"|xargs); do
+	for i in ${DBS}; do
+		echo "|   |-- $i ($(date +%Y-%m-%d_%H:%M:%S)) ..."|tee -a ${LOG}
+		# schema -> sql
+		echo "|   |   |-- pg_dump -Upostgres -hlocalhost -p5433 --clean --create --if-exists --schema-only $i -f ${BACKUP_DIR}/pgsql/${i}_schema.sql"|tee -a ${LOG}
+		pg_dump -Upostgres -hlocalhost -p5433 --clean --create --if-exists -Fp --schema-only ${i} -f ${BACKUP_DIR}/pgsql/${i}_schema.sql 2>&1|tee -a ${LOG} || \
+        		echo "|   |   |   '-- ERROR: Exit code $?"|tee -a ${LOG}
+		# db -> directory
+		mkdir -p ${BACKUP_DIR}/pgsql/$i
+		echo "|   |   |-- pg_dump -Upostgres -hlocalhost -p5433 -Fd -j4 $i -f ${BACKUP_DIR}/pgsql/$i"|tee -a ${LOG}
+		#pg_dump -v -Upostgres -hlocalhost -p5433 -Fd -j4 "$i" -f "${BACKUP_DIR}/pgsql/$i" 2>&1|tee -a ${LOG}
+		pg_dump -v -Upostgres -hlocalhost -p5433 -Fd -j4 "$i" -f "${BACKUP_DIR}/pgsql/$i" >> ${LOG} 2>&1 || \
+        		echo "|   |   '-- ERROR: Exit code $?"|tee -a ${LOG}
+	done
+	#done 2>&1 | tee ${LOG}
+	forward_finish pgsql
+        #ls -la ${LOG}|sed 's#^#| #g'
+        du -sh ${BACKUP_DIR}/pgsql|sed 's#\s\s*# #g;s#^#|   |-- Directory size: #g'
+        echo "|   |-- Log file ${LOG}"
+	echo "|   '-- PostgreSQL backup finished ($(date +%Y-%m-%d_%H:%M:%S))"
+}
+
+#### #### #### #### #### #### #### ####
+backup_pgsql_internal () {
+	local BACKUP_DIR="$1"
+	[ -d "${BACKUP_DIR}" ] || ERROR "backup directory ${BACKUP_DIR} does not exist"
+	# backup PostgreSQL to /tmp/pgsql.tar inside of the pod
+	local LOG="${BACKUP_DIR}/pgsql-backup.log"
+	>${LOG}
+	echo "|-- PostgreSQL backup-inside-of-a-pod ($(date +%Y-%m-%d_%H:%M:%S))"
+        echo "|   |-- Directory ${BACKUP_DIR}/pgsql"
+        echo "|   '-- Log file ${LOG}"
+	echo "|-- Backing up data inside of the pcs-postgresql-0 pod ..."
+	#kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-postgresql-0 -c postgresql -- bash -c '/opt/bitnami/scripts/postgresql-repmgr/entrypoint.sh; export PGPASSWORD=${POSTGRES_POSTGRES_PASSWORD}; rm -rf "/tmp/pgsql"; for i in $(psql -U postgres -h localhost -t -c "SELECT datname FROM pg_database;"| grep -vE "template|repmgr|postgres"| sed "s/\r//g"|xargs); do echo "|   |-- $i"; mkdir -p "/tmp/pgsql/$i" && pg_dump -Upostgres -hlocalhost -Fd -j4 "$i" -f "/tmp/pgsql/$i"; du -sh "/tmp/pgsql/$i"|sed "s#^#|   |   '"'"'-- #g"; done && cd /tmp && tar cf pgsql.tar pgsql && echo && du -sh /tmp/pgsql && ls -la /tmp/pgsql.tar && rm -rf /tmp/pgsql && echo "Exit code: $?"' > ${LOG} 2>&1 || ERROR "backup exit code is not 0"
+	kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-postgresql-0 -c postgresql -- bash -c '/opt/bitnami/scripts/postgresql-repmgr/entrypoint.sh; export PGPASSWORD=${POSTGRES_POSTGRES_PASSWORD}; rm -rf "/tmp/pgsql"; for i in $(psql -U postgres -h localhost -t -c "SELECT datname FROM pg_database;"| grep -vE "template|repmgr|postgres"| sed "s/\r//g"|xargs); do echo "|   |-- $i"; mkdir -p "/tmp/pgsql/$i" && pg_dump -v -Upostgres -hlocalhost -Fd -j4 "$i" -f "/tmp/pgsql/$i"; du -sh "/tmp/pgsql/$i"|sed "s#\s\s*# #g;s#^#|   |   '"'"'-- Size: #g"; done && cd /tmp && tar cf pgsql.tar pgsql && echo && du -sh /tmp/pgsql && ls -la /tmp/pgsql.tar && rm -rf /tmp/pgsql && echo "Exit code: $?"' 2>&1| tee -a ${LOG}|grep '^|   ' || ERROR "backup exit code is not 0"
+	echo "|   |-- Backing up data inside of the pcs-postgresql-0 pod exit code is 0"
+	echo "|   |-- Copying pcs-postgresql-0:/tmp/pgsql.tar to ${BACKUP_DIR}/pgsql.tar"
+  if OUT=$(kubectl -n ${DR_CORE_NAMESPACE} cp pcs-postgresql-0:/tmp/pgsql.tar ${BACKUP_DIR}/pgsql.tar 2>&1); then
+    echo "|   |   '-- ${BACKUP_DIR}/pgsql.tar"
+  else
+    echo "${OUT}"
+    ERROR "Cannot get pgsql.tar"
+  fi
+	kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-postgresql-0 -c postgresql -- bash -c 'rm -f /tmp/pgsql.tar'
+        #ls -la ${LOG}|sed 's#^#| #g'
+        du -sh ${BACKUP_DIR}/pgsql.tar|sed 's#\s\s*# #g;s#^#|   |-- Backup size: #g'
+        echo "|   |-- Log file ${LOG}"
+	echo "|   '-- PostgreSQL backup finished ($(date +%Y-%m-%d_%H:%M:%S))"
+}
+
+#### #### #### #### #### #### #### ####
+backup_help () {
+	echo "DataRobot backup commands"
+	echo
+	echo "If you have correct versions of mongodump and pg_dump binaries"
+	echo "installed on the privisioner (according to the guide):"
+	echo "  $0 backup all <backups-directory>"
+	echo "To perform backup steps separately:"
+	echo "     $0 backup values <backups-directory>"
+	echo "     $0 backup mongo <backups-directory>"
+	echo "     $0 backup pgsql <backups-directory>"
+	echo "     $0 backup elasticsearch <backups-directory>"
+	echo
+	echo "If you do NOT have mongodump and pg_dump on the provisioner"
+	echo "and want to backup databases inside of DB pods"
+	echo "(make sure pods have enough disk space):"
+	echo "  $0 backup all-internal <backups-directory>"
+	echo "To perform backup steps separately:"
+	echo "     $0 backup values <backups-directory>"
+	echo "     $0 backup mongo-internal <backups-directory>"
+	echo "     $0 backup pgsql-internal <backups-directory>"
+	echo "     $0 backup elasticsearch <backups-directory>"
+	echo
+	exit 1
+}
+dr_backup () {
+	local TYPE=$(echo "$1"|tr 'A-Z' 'a-z')
+	[ -z "${TYPE}" ] && backup_help
+	[ "help" = "${TYPE}" ] && backup_help
+	check_tool jq
+	local BACKUPS_LOCATION="$2"
+  BACKUPS_LOCATION=$(echo ${BACKUPS_LOCATION}|sed 's/\/$//g')
+	[ -z "${BACKUPS_LOCATION}" ] && ERROR "backup location not specified"
+	[ -d "${BACKUPS_LOCATION}" ] || ERROR "backup location directory ${BACKUPS_LOCATION} does not exist"
+	local BACKUP_DIRECTORY="${BACKUPS_LOCATION}/dr-backup-$(date +%Y%m%d)"
+	mkdir -p "${BACKUP_DIRECTORY}"
+	echo ".-- DataRobot backup into ${BACKUP_DIRECTORY}"
+	case "${TYPE}" in
+		values)
+			backup_values "${BACKUP_DIRECTORY}"
+			;;
+		mongo-internal)
+			backup_mongo_internal "${BACKUP_DIRECTORY}"
+			;;
+		mongo)
+			backup_mongo_external "${BACKUP_DIRECTORY}"
+			;;
+		pgsql-internal)
+			backup_pgsql_internal "${BACKUP_DIRECTORY}"
+			;;
+		pgsql)
+			backup_pgsql_external "${BACKUP_DIRECTORY}"
+			;;
+    es|elasticsearch|es-internal|elasticsearch-internal)
+      backup_es "${BACKUP_DIRECTORY}"
+      ;;
+		all-internal)
+			echo "|"
+			backup_values "${BACKUP_DIRECTORY}"
+			echo "|"
+			backup_mongo_internal "${BACKUP_DIRECTORY}"
+			echo "|"
+			backup_pgsql_internal "${BACKUP_DIRECTORY}"
+			echo "|"
+      backup_es "${BACKUP_DIRECTORY}"
+			echo "|"
+			;;
+		all)
+			echo "|"
+			backup_values "${BACKUP_DIRECTORY}"
+			echo "|"
+			backup_mongo_external "${BACKUP_DIRECTORY}"
+			echo "|"
+			backup_pgsql_external "${BACKUP_DIRECTORY}"
+			echo "|"
+      backup_es "${BACKUP_DIRECTORY}"
+			echo "|"
+			;;
+		*) echo "!!!! Unknown backup type !!!!"
+			backup_help
+			;;
+	esac
+	echo "'-- DataRobot backup into ${BACKUP_DIRECTORY}"
+}
+
+#### #### #### #### #### #### #### ####
+load_images () {
+	if [ -n "$1" ]; then
+		DR_APP="$1"
+        	[ -n "$2" ] && DR_PCS="$2" || DR_PCS=""
+	fi
+	check_tool docker
+	check_tool zstd
+        echo ".-- DataRobot images to be loaded to local docker"
+	#echo "DR_APP=[${DR_APP}]"
+	#echo "DR_PCS=[${DR_PCS}]"
+	for i in ${DR_PCS} ${DR_APP}; do
+		#echo "i=[${i}]"
+		if [ -d $i/images ]; then
+			echo "|-- Directory $i/images"
+                        for FF in $(find ${i}/images -type f -name "*.zst"); do
+				echo -n "|   |-- Image ${FF} ... "
+                                #TT=$(echo "${FF}"|sed 's#.zst$##g')
+                                #[ -f ${TT} ] && rm -f ${TT}
+                                #[ -f ${TT} ] && ERROR "cannot rewrite ${TT}"
+                                #echo "|   |-- ${FF} -> $(basename ${TT})"
+                                #echo -n "|   |-- $(basename ${TT}) ... "
+                                #SYSTEM "zstd -d --long=30 ${FF}"
+                                #SYSTEM "docker load -i ${TT}"
+                                SYSTEM "zstd -d --long=30 --stdout ${FF} | docker load -q"
+                                #[ -f ${TT} ] && rm -f ${TT}
+                                #echo "|   |   '-- $(basename ${TT}) loaded"
+                                echo "Ok"
+                        done
+			echo "|   '-- Directory $i/images"
+		else
+			echo "|-- Directory $i/images not found"
+		fi
+        done
+        echo "'-- DataRobot images loaded to local docker"
+}
+
+#### #### #### #### #### #### #### ####
+push_images () {
+	check_tool docker
+	echo ".-- DataRobot images push from local docker to artifactory"
+	#### Get installation type
+	K_VERSION=$(kubectl version 2>&1|grep 'Server Version'); [ -z "${K_VERSION}" ] && ERROR "Cannot get Kubernetes Server Version (kubectl version)"
+	#CLOUD=azure; echo "${K_VERSION}"|grep '\-eks-' >/dev/null && CLOUD=aws; echo "${K_VERSION}"|grep '\-gke' >/dev/null && CLOUD=google;
+	CLOUD="generic"
+	if echo "${K_VERSION}"|grep '\-eks-' >/dev/null; then
+		CLOUD=aws
+	elif echo "${K_VERSION}"|grep '\-gke' >/dev/null; then
+		CLOUD=google
+	elif az >/dev/null 2>&1; then
+		CLOUD=azure
+	fi
+	#echo "CLOUD=[${CLOUD}]"
+#### #### #### #### #### #### #### ####
+        if echo "${CLOUD}"|grep -i "aws" >/dev/null; then
+                push_ecr "$1"
+        elif echo "${CLOUD}"|grep -i "azure" >/dev/null; then
+                push_acr "$1"
+        elif echo "${CLOUD}"|grep -i "google" >/dev/null; then
+                push_gcr "$1"
+	else
+		echo "Openshift, generic type, push images manually"
+		exit 0
+        fi
+	echo "'-- DataRobot images push from local docker to artifactory"
+}
+
+#### #### #### #### #### #### #### ####
+push_ecr () {
+	local DOCKER_REGISTRY_URL="$1"
+	[ -z "${DOCKER_REGISTRY_URL}" ] && ERROR "parameter DOCKER_REGISTRY_URL is empty"
+	local DOCKER_REGISTRY_ROOT="${DOCKER_REGISTRY_URL%%/*}"
+	local DOCKER_REGISTRY_DIR="/${DOCKER_REGISTRY_URL#*/}"
+	local REGION=$(echo ${DOCKER_REGISTRY_URL}|sed 's#\.amazonaws\.com.*##g;s#^.*\.##g')
+	[ -z "${REGION}" ] && ERROR "REGION received from DOCKER_REGISTRY_URL is empty"
+	#
+        SYSTEM "aws ecr get-login-password --region ${REGION}"
+        local DOCKER_REGISTRY_PASSWORD="${SYSTEM_OUTPUT}"
+        [ -z "${DOCKER_REGISTRY_PASSWORD}" ] && ERROR "DOCKER_REGISTRY_PASSWORD is empty"
+	local DOCKER_REGISTRY_USERNAME='AWS'
+	echo "|-- Docker registry vaiables:"
+        for i in DOCKER_REGISTRY_URL DOCKER_REGISTRY_USERNAME DOCKER_REGISTRY_PASSWORD; do
+                #[ -z "${!i}" ] && ERROR "variable $i not defined"
+                echo "$i"|grep PASSWORD >/dev/null && echo "|   |-- $i=[${!i:0:10}...]" || echo "|   |-- $i=[${!i}]"
+        done
+	SYSTEM "docker login -u ${DOCKER_REGISTRY_USERNAME} -p ${DOCKER_REGISTRY_PASSWORD} ${DOCKER_REGISTRY_URL}"
+        echo "|-- Docker Login Succeeded"
+        #
+        SYSTEM "docker images --digests  --format '{{.Repository}}:{{.Tag}}|{{.Digest}}'"
+        local IMAGES=$(echo "${SYSTEM_OUTPUT}"|grep -v "^${DOCKER_REGISTRY_ROOT}"|sed 's/|.*$//g'|grep -v kindest/node|sort -u)
+        #local REPOS=$(echo "${IMAGES}"|sed 's|:.*$||g'|sed "s|^|${DOCKER_REGISTRY_DIR}/|g;s|^/||g"|sort -u)
+        local REPOS=$(echo "${IMAGES}"|sed 's|:.*$||g'|sort -u)
+	#
+	local BUILD_SERVIC_ECR_REPOS="base-image services/custom-model-conversion managed-image ephemeral-image custom-apps/managed-image custom-jobs/managed-image custom-apps-managed-image"
+        #local REPOS_CUSTOM=$(for i in ${BUILD_SERVIC_ECR_REPOS}; do echo $i; done|sed "s|^|${DOCKER_REGISTRY_DIR}/|g;s|^/||g"|sort -u)
+        local REPOS_CUSTOM=$(for i in ${BUILD_SERVIC_ECR_REPOS}; do echo $i; done|sort -u)
+        #
+        echo "|-- Repositories:"
+        for i in ${REPOS} ${REPOS_CUSTOM}; do
+                local REP="${DOCKER_REGISTRY_DIR:1}/${i}"
+                #local REP=$(echo "$i"|sed "s|^|${DOCKER_REGISTRY_DIR}/|g;s|^/||g");
+                #echo "######## DEBUG: [${REP}]"
+                if aws ecr describe-repositories --repository-names "${REP}" >/dev/null 2>&1; then
+                        echo "|   |-- repository ${REP} found"
+                else
+                        #echo "aws ecr create-repository --repository-name ${REP} --region ${REGION}"
+                        SYSTEM "aws ecr create-repository --repository-name ${REP} --region ${REGION}"
+                        echo "|   |-- repository ${REP} created" ;
+                fi
+        done
+        echo "|   '-- Repositories"
+	#
+        echo "|-- Images:"
+        for i in ${IMAGES}; do
+                local REP=$(echo "$i"|awk -F':' '{print $1}'|sed "s|^|${DOCKER_REGISTRY_DIR}/|g;s|^/||g");
+                local TAG=$(echo "$i"|awk -F':' '{print $2}')
+                local IMG="${DOCKER_REGISTRY_URL}/$i"
+                #if aws ecr list-images --repository-name ${REP}|grep '"imageTag": "'"${TAG}"'"' >/dev/null; then
+                SYSTEM "aws ecr list-images --repository-name ${REP}"
+                if echo "${SYSTEM_OUTPUT}"|grep '"imageTag": "'"${TAG}"'"' >/dev/null; then
+                        echo "|   |-- image ${IMG} found"
+                else
+                        #echo "docker tag $i ${IMG}"
+                        SYSTEM "docker tag $i ${IMG}"
+                        echo "|   |-- docker tag push ${IMG}"
+                        #echo "docker push ${IMG}"
+                        SYSTEM "docker push ${IMG}"
+                        echo "|   |   '-- docker push ${IMG}"
+                fi
+        done
+        echo "|   '-- Images"
+}
+
+#### #### #### #### #### #### #### ####
+push_acr () {
+        local FULL_ACR_URL="$1"
+        [ -z "${FULL_ACR_URL}" ] && ERROR "parameter FULL_ACR_URL is empty"
+        local ACR=$(echo "${FULL_ACR_URL}"|sed 's#\..*$##g')
+        [ -z "${ACR}" ] && ERROR "value ACR received from FULL_ACR_URL is empty"
+        SYSTEM "az acr login --expose-token -n ${ACR}"
+        local ACCESS_TOKEN=$(echo "${SYSTEM_OUTPUT}"|grep '"accessToken":'|awk '{print $2}'|cut -d'"' -f2)
+        local LOGIN_SERVER=$(echo "${SYSTEM_OUTPUT}"|grep '"loginServer":'|awk '{print $2}'|cut -d'"' -f2)
+        [ -z "${ACCESS_TOKEN}" ] && ERROR "Got empty accessToken"
+        [ -z "${LOGIN_SERVER}" ] && ERROR "Got empty loginServer"
+        #echo "SYSTEM_OUTPUT=[${SYSTEM_OUTPUT}]"
+        #echo "ACCESS_TOKEN=[${ACCESS_TOKEN}]"
+        #echo "LOGIN_SERVER=[${LOGIN_SERVER}]"
+        SYSTEM "docker login ${LOGIN_SERVER} -u 00000000-0000-0000-0000-000000000000 -p \"${ACCESS_TOKEN}\""
+        #echo "SYSTEM_OUTPUT=[${SYSTEM_OUTPUT}]"
+        echo "${SYSTEM_OUTPUT}"|grep 'Login Succeeded' >/dev/null || ERROR "Cannot log to ACR"
+        SYSTEM "docker images --format '{{.Repository}}:{{.Tag}}'"
+        local IMAGES=$(echo "${SYSTEM_OUTPUT}"|grep -v 'registry'|grep -v ${ACR})
+        echo "|-- Images:"
+        for i in ${IMAGES}; do
+                #echo "IMAGE: $i"
+                local TAGS=''
+                local IMAGE_FOUND=false
+                #echo "az acr repository show-tags -n ${ACR} --repository ${FULL_ACR_URL#*/}/${i%:*}"
+                if TAGS=$(az acr repository show-tags -n ${ACR} --repository ${FULL_ACR_URL#*/}/${i%:*} -otsv 2>&1); then
+                        #echo "TAGS: [${TAGS}]"
+                        for t in ${TAGS}; do
+                                #echo ${FULL_ACR_URL#*/}/${i%:*}:$t
+                                [ "x$i" = "x${i%:*}:$t" ] && IMAGE_FOUND=true # && echo "!!! Image found: $i !!!"
+                        done
+                fi
+                if $IMAGE_FOUND; then
+                        #echo "|   |-- image ${FULL_ACR_URL#*/}/${i%:*}:$t found"
+                        echo "|   |-- image ${FULL_ACR_URL}/$i found"
+                else
+                #       docker tag $i $NEW_REPO
+                        SYSTEM "docker tag $i ${FULL_ACR_URL}/$i"
+                        echo "|   |-- docker tag push ${FULL_ACR_URL}/$i"
+                        SYSTEM "docker push ${FULL_ACR_URL}/$i"
+                        echo "|   |   '-- docker push ${FULL_ACR_URL}/$i"
+                fi
+        done
+        echo "|   '-- Images"
+}
+
+#### #### #### #### #### #### #### ####
+push_gcr () {
+	local FULL_GCR_URL="$1"
+	[ -z "${FULL_GCR_URL}" ] && ERROR "parameter FULL_GCR_URL for procedure push_gcr is empty"
+        GCR=$(echo "${FULL_GCR_URL}"|cut -d'/' -f1-3)
+        SYSTEM "echo y|gcloud auth configure-docker ${FULL_GCR_URL%%/*}"
+        SYSTEM "docker login ${GCR}"
+        #SYSTEM "docker login ${LOGIN_SERVER} -u 00000000-0000-0000-0000-000000000000 -p \"${ACCESS_TOKEN}\""
+        #echo "SYSTEM_OUTPUT=[${SYSTEM_OUTPUT}]"
+        #echo "${SYSTEM_OUTPUT}"|grep 'Login Succeeded' >/dev/null || ERROR "Cannot log to ACR"
+        SYSTEM "docker images --format '{{.Repository}}:{{.Tag}}'"
+        local IMAGES=$(echo "${SYSTEM_OUTPUT}"|grep -v 'registry'|grep -v "${GCR}")
+        SYSTEM "gcloud artifacts docker images list ${FULL_GCR_URL} --include-tags"
+        local ARTIFACTS=$(echo "${SYSTEM_OUTPUT}")
+        #echo "${ARTIFACTS}"
+        echo "|-- Images:"
+        for i in ${IMAGES}; do
+                local TAGS=''
+                if echo "${ARTIFACTS}"|grep "^${FULL_GCR_URL}/${i%%:*} .* ${i##*:} " >/dev/null; then
+                        echo "|   |-- image ${FULL_GCR_URL}/$i found"
+                else
+                        SYSTEM "docker tag $i ${FULL_GCR_URL}/$i"
+                        echo "|   |-- docker tag push ${FULL_GCR_URL}/$i"
+                        SYSTEM "docker push ${FULL_GCR_URL}/$i"
+                        echo "|   |   '-- docker push ${FULL_GCR_URL}/$i"
+                fi
+        done
+        echo "|   '-- Images"
+}
+
+##### #### #### #### #### #### #### ####
+forward_start () {
+        [ -z "$1" ] && ERROR "procedure forward_start missing argument"
+        local SERVICE="$1"
+        local FORWARD_LINE=''
+        #echo "SERVICE=[${SERVICE}]"
+        case ${SERVICE} in
+                pgsql) FORWARD_LINE="${PGSQL_FORWARD_LINE}"
+                        ;;
+                mongo) FORWARD_LINE="${MONGO_FORWARD_LINE}"
+                        ;;
+                *) ERROR "procedure forward_start argument should be pgsql or mongo"
+                        ;;
+        esac
+        local CMD="kubectl -n ${DR_CORE_NAMESPACE} ${FORWARD_LINE}"
+        nohup ${CMD} >/dev/null 2>&1 &
+        sleep 3
+        ps axwwu|grep -v grep|grep "${FORWARD_LINE}" >/dev/null || ERROR "Cannot find port forwarding started: ${CMD}"
+        echo "|-- Port forwarding for ${SERVICE} created: ${FORWARD_LINE}"
+}
+
+#### #### #### #### #### #### #### ####
+forward_finish () {
+        [ -z "$1" ] && ERROR "procedure forward_finish missing argument"
+        local SERVICE="$1"
+        local FORWARD_LINE=''
+        case ${SERVICE} in
+                pgsql) FORWARD_LINE="${PGSQL_FORWARD_LINE}"
+                        ;;
+                mongo) FORWARD_LINE="${MONGO_FORWARD_LINE}"
+                        ;;
+                *) ERROR "procedure forward_start arg should be pgsql or mongo"
+                        ;;
+        esac
+        local PROCESSES=$(ps axwwu|grep "${FORWARD_LINE}"|grep -v grep|awk '{print $2}'|xargs)
+        if [ -n "${PROCESSES}" ]; then
+                kill ${PROCESSES} >/dev/null 2>&1;
+                wait ${PROCESSES} >/dev/null 2>&1;
+        fi
+}
+
+#### #### #### #### #### #### #### ####
+check_secret () {
+	local SECRET=$1
+	local YAML=''
+	if YAML=$(kubectl -n ${DR_CORE_NAMESPACE} get secret ${SECRET} -o yaml 2>&1); then
+		YAML=$(echo "${YAML}"|sed 's#\r##g')
+		echo "|-- secret $1"
+	else
+		#echo "|-- secret $1 not found"
+		shift
+		return 0
+	fi
+	shift
+	local PYTHON="python"
+        ${PYTHON} --help >/dev/null 2>&1 || PYTHON="python3"
+        ${PYTHON} --help >/dev/null 2>&1 || ERROR "python not found"
+	[ -z "$1" ] && echo "Procedure check_secret missing args" && exit 1
+	while [ -n "$1" ]; do
+		local KEY=$(echo "${1}"|cut -d'.' -f1)
+		if echo "${1}"|grep '.json' >/dev/null; then
+			#echo JSON ${SECRET} $1 ${KEY}
+			local R=$(echo "${YAML}"|grep '.json:'|awk '{print $2}'|base64 -d|${PYTHON} -m json.tool|grep "${KEY}/"|sed 's#^\s*##g')
+			echo "|   *-- ${1} ${R}"
+			local F=$(echo "${R}"|cut -d'"' -f4)
+      if kubectl -n ${DR_CORE_NAMESPACE} get deploy mmapp-app --no-headers|grep '^mmapp-app\s*./0' >/dev/null; then
+        echo "|       '-- deploy mmapp-app scaled to 0, cannot check ${F} file content"
+      else
+			  #echo "#### kubectl -n ${DR_CORE_NAMESPACE} exec -it deploy/mmapp-app -- bash -c \"cat ${F}\""
+			  local R=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it deploy/mmapp-app -- bash -c "cat ${F}")
+			  echo "|       '-- deploy/mmapp-app file content: ${R}"
+      fi
+		elif echo "${1}"|grep '.sql' >/dev/null; then
+			#
+			# echo kubectl -n ${DR_CORE_NAMESPACE} get secret ${SECRET} -o yaml|grep $1|awk '{print $2}'|base64 -d
+			# kubectl get secret pcs-postgresql-initdb -n ${DR_CORE_NAMESPACE} -o yaml|grep modmon|awk '{print $2}'|base64 -d|grep PASSWORD
+			local R=$(echo "${YAML}"|grep " $1:"|awk '{print $2}'|base64 -d|grep "${KEY}"|grep PASSWORD)
+			echo "|   *-- $1: ${R}"
+		else
+			local R=$(echo "${YAML}"|grep " $1:"|awk '{print $2}'|base64 -d)
+			echo "|   *-- $1: $R"
+		fi
+		shift
+	done
+}
+
+#### #### #### #### #### #### #### ####
+pgsql_cluster_status () {
+	local STATUS=''
+	STATUS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-postgresql-0 -- bash -c ". /opt/bitnami/scripts/libpostgresql.sh;postgresql_enable_nss_wrapper >/dev/null 2>/dev/null; repmgr cluster show -f /opt/bitnami/repmgr/conf/repmgr.conf --compact") #  || ERROR "Cannot get PostgreSQL master/slave info from pcs-postgresql-0"
+	echo "|"
+	echo "${STATUS}"|sed 's#^#|  #g'
+	echo "|"
+}
+
+#### #### #### #### #### #### #### ####
+pgsql_info () {
+	echo ".-- PostgreSQL info"
+	echo "|-- PostgreSQL cluster status"
+	pgsql_cluster_status
+	check_secret datarobot-secrets              modmon.json messagequeue.json postgres.json
+	echo "|"
+	check_secret pcs-db-buildservice            database username password
+	check_secret pcs-db-cspspark                database username password
+	check_secret pcs-db-identityresourceservice database username password
+	check_secret pcs-db-messagequeue            database username password
+	check_secret pcs-db-modmon                  database username password
+	check_secret pcs-db-predenv                 database username password
+	check_secret pcs-db-sushihydra              database username password
+	echo "|"
+	check_secret pcs-pgpool                admin-password
+	echo "|"
+	check_secret pcs-pgpool-custom-users   passwords usernames
+	echo "|"
+	check_secret pcs-postgresql            database username password postgres-username postgres-password repmgr-username repmgr-password
+	echo "|"
+	check_secret pcs-postgresql-initdb     buildservice.sql cspspark.sql identityresourceservice.sql messagequeue.sql modmon.sql predenv.sql sushihydra.sql
+	check_secret pcs-postgresql-initsql    buildservice.sql cspspark.sql identityresourceservice.sql messagequeue.sql modmon.sql predenv.sql sushihydra.sql
+	echo "|"
+	check_secret pcs-postgresql-initdb-cfg POSTGRESQL_INITSCRIPTS_PASSWORD POSTGRESQL_INITSCRIPTS_USERNAME
+	echo "'-- PostgreSQL info"
+}
+
+#### #### #### #### #### #### #### ####
+mongo_info (){
+	local STATUS=''
+	STATUS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-mongo-0 -- bash -c 'echo "rs.status()"|mongosh -u ${MONGODB_ROOT_USER} -p ${MONGODB_ROOT_PASSWORD}') || ERROR "Cannot retrieve rs.status() from pcs-mongo-0"
+	echo ".-- MongoDB info"
+	echo "|-- MongoDB cluster details:"
+	echo "${STATUS}"|grep -E 'name:|state'|sed "s#^\s*##g;s#^name:#|   |-- name:#g;s#^state:#|   |   |-- state:#g;s#^stateStr:#|   |   '-- stateStr:#g;"
+	echo "|   '-- MongoDB cluster details"
+	local UU='pcs-mongodb'
+	if kubectl -n ${DR_CORE_NAMESPACE} get secret|grep "^pcs-mongo-username\s" >/dev/null; then
+		SYSTEM "kubectl -n ${DR_CORE_NAMESPACE} get secret pcs-mongo-username -o yaml"
+		UU=$(echo "${SYSTEM_OUTPUT}"|grep mongodb-root-username:|awk '{print $2}'|base64 -d)
+		[ -z "${UU}" ] && ERROR "MongoDB root username was not received (from pcs-mongo-username secret)"
+	fi
+	SYSTEM "kubectl -n ${DR_CORE_NAMESPACE} get secret pcs-mongo -o yaml"
+	local PP=$(echo "${SYSTEM_OUTPUT}"|grep mongodb-root-password:|awk '{print $2}'|base64 -d)
+	[ -z "${PP}" ] && ERROR "MongoDB ${UU} user passord was not received (from pcs-mongo secret)"
+	echo "|-- MongoDB  root username: ${UU}"
+	echo "|   '-- root user password: ${PP}"
+	echo "'-- MongoDB info"
+}
+
+#### #### #### #### #### #### #### ####
+es_info () {
+  echo ".-- Elasticsearch cluster details:"
+  kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-elasticsearch-master-0 -c elasticsearch -- bash -c 'curl -k -u elastic:$ELASTICSEARCH_PASSWORD https://localhost:9200/_cat/nodes?v'|sed 's/^/|   /g'
+  local MASTER=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-elasticsearch-master-0 -c elasticsearch -- bash -c 'curl -k -u elastic:$ELASTICSEARCH_PASSWORD https://localhost:9200/_cat/master?v'|grep -v '^id\s'|sed 's/\r//g'|awk '{print $4}')
+  echo "|-- Elasticsearch master node: ${MASTER}"
+  local REPOS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c 'curl -k -u elastic:$ELASTICSEARCH_PASSWORD "https://localhost:9200/_snapshot?pretty"'| jq -r 'keys[]'|xargs)
+  local SNAPS=''
+  echo "|-- Repositories: [${REPOS}]"
+
+  for i in ${REPOS}; do
+    #SNAPS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c "curl -k -u elastic:\$ELASTICSEARCH_PASSWORD   \"https://localhost:9200/_snapshot/${i}/_all?pretty\""|sed 's/\r//g'|jq -r '.snapshots[].snapshot')
+    SNAPS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c 'curl -sku elastic:$ELASTICSEARCH_PASSWORD "https://localhost:9200/_snapshot/'${i}'/_all"'| jq -r ".snapshots[].snapshot" 2>/dev/null|xargs)
+  done
+  echo "'-- Repository ${i} snapshots: [${SNAPS}]"
+  return
+}
+
+#### #### #### #### #### #### #### ####
+backup_es () {
+  local BACKUP_DIR="$1"
+  [ -d "${BACKUP_DIR}" ] || ERROR "backup directory ${BACKUP_DIR} does not exist"
+  local LOG="${BACKUP_DIR}/es-backup.log"
+  local REPO="dr_local_repo"
+  local SNAP="dr_local_snapshot"
+  local INFO=''
+  local REPOS=''
+  local SNAPS=''
+  local FOUND=false
+  local STATUS=0
+  local BODY=""
+	echo "|-- Elasticsearch backup-inside-of-a-pod ($(date +%Y-%m-%d_%H:%M:%S))"
+  echo "|-- Elasticsearch cluster details:"
+  kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-elasticsearch-master-0 -c elasticsearch -- bash -c 'curl -k -u elastic:$ELASTICSEARCH_PASSWORD https://localhost:9200/_cat/nodes?v'|sed 's/^/|   /g'
+  local MASTER=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-elasticsearch-master-0 -c elasticsearch -- bash -c 'curl -k -u elastic:$ELASTICSEARCH_PASSWORD https://localhost:9200/_cat/master?v'|grep -v '^id\s'|sed 's/\r//g'|awk '{print $4}')
+  echo "|-- Elasticsearch master node: ${MASTER}"
+  #
+  # list repos and snaps
+  REPOS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c 'curl -k -u elastic:$ELASTICSEARCH_PASSWORD "https://localhost:9200/_snapshot?pretty"'| jq -r 'keys[]' 2>/dev/null|xargs)
+  echo "|-- Repositories: [${REPOS}]"
+  FOUND=false
+  for i in ${REPOS}; do
+    SNAPS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c 'curl -sku elastic:$ELASTICSEARCH_PASSWORD "https://localhost:9200/_snapshot/'${i}'/_all"'| jq -r ".snapshots[].snapshot" 2>/dev/null|xargs)
+    [ -n "${SNAPS}" ] && echo "|   |-- Repo $i snapshots: [${SNAPS}]" && FOUND=true
+  done
+  ${FOUND} && echo "|   '-- Repositories"
+  #
+  #register backup repository
+  #echo "|"
+  echo "|-- Registering new repository"
+  # create REPO
+  if INFO=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c "
+curl -X PUT -k -u elastic:\$ELASTICSEARCH_PASSWORD \"https://localhost:9200/_snapshot/${REPO}?pretty\" \
+ -H 'Content-Type: application/json' -d'
+{
+  \"type\": \"fs\",
+  \"settings\": {
+    \"location\": \"/snapshots\"
+  }
+}
+' 2>&1" 2>&1); then 
+    echo "|   '-- Repository ${REPO} initialized"
+  else
+    ERROR "Caanot init repo ${REPO}: ${INFO}"
+  fi
+  SNAPS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c 'curl -sku elastic:$ELASTICSEARCH_PASSWORD "https://localhost:9200/_snapshot/'${i}'/_all"'| jq -r ".snapshots[].snapshot"|xargs)
+  for i in ${SNAPS}; do
+    if echo "${i}"|grep "^${SNAP}$">/dev/null; then
+      echo "|-- Snapshot ${SNAP} repository ${REPO} already exists"
+      INFO=$(kubectl -n ${DR_CORE_NAMESPACE} exec -i ${MASTER} -c elasticsearch -- bash -c "
+        curl -s -k -w '\n%{http_code}' -X DELETE -u elastic:\$ELASTICSEARCH_PASSWORD \
+        \"https://localhost:9200/_snapshot/${REPO}/${SNAP}?pretty\"")
+      STATUS=$(echo "$INFO" | tail -n1)
+      BODY=$(echo "$INFO" | sed '$d')
+      if [[ "$STATUS" == "200" ]]; then
+        echo "|   '-- Snapshot ${SNAP} repository ${REPO} deleted"
+      else
+        ERROR "Snapshoti ${SNAP} repository ${REPO} deletion failed (HTTP $STATUS)
+${BODY}"
+      fi
+    fi
+  done
+  # create snapshot
+  echo "|-- Creating snapshot ${SNAP} repository ${REPO}"
+  INFO=$(kubectl -n ${DR_CORE_NAMESPACE} exec -i ${MASTER} -c elasticsearch -- bash -c "
+  curl -s -k -w '\n%{http_code}' -X PUT -u elastic:\$ELASTICSEARCH_PASSWORD \
+  \"https://localhost:9200/_snapshot/${REPO}/${SNAP}?wait_for_completion=true\"")
+  STATUS=$(echo "${INFO}" | tail -n1)
+  BODY=$(echo "${INFO}" | sed '$d')
+  echo "${BODY}" > ${LOG}
+  #echo "STATUS=[${STATUS}]"
+  #echo "BODY=[${BODY}]"
+  if [[ "${STATUS}" -ge 200 && "${STATUS}" -lt 300 ]]; then
+    echo "|   '-- Snapshot ${SNAP} repository ${REPO} created"
+  else
+    ERROR "!!!! Snapshot creation failed with HTTP $STATUS
+ $BODY"
+  fi
+  #echo "|"
+
+  # list repos and snaps
+  REPOS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c 'curl -k -u elastic:$ELASTICSEARCH_PASSWORD "https://localhost:9200/_snapshot?pretty"'| jq -r 'keys[]'|xargs)
+  echo "|-- Repositories: [${REPOS}]"
+  FOUND=false
+  for i in ${REPOS}; do
+    SNAPS=$(kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c 'curl -sku elastic:$ELASTICSEARCH_PASSWORD "https://localhost:9200/_snapshot/'${i}'/_all"'| jq -r ".snapshots[].snapshot"|xargs)
+    [ -n "${SNAPS}" ] && echo "|   |-- Repo $i snapshots: [${SNAPS}]" && FOUND=true
+  done
+  ${FOUND} && echo "|   '-- Repositories"
+  echo "|-- Creating backup archive /tmp/es.tar"
+  kubectl -n ${DR_CORE_NAMESPACE} exec -it ${MASTER} -c elasticsearch -- bash -c "tar cf /tmp/es.tar /snapshots > /dev/null 2>&1" || ERROR "Cannot create archive /tmp/es.tar"
+
+	echo "|   |-- copying ${MASTER}:/tmp/es.tar to ${BACKUP_DIR}/es.tar"
+	if OUT=$(kubectl -n ${DR_CORE_NAMESPACE} cp ${MASTER}:/tmp/es.tar ${BACKUP_DIR}/es.tar 2>&1); then
+    echo "|   |   '-- ${BACKUP_DIR}/es.tar"
+  else
+    echo "${OUT}"
+    ERROR "ERROR: Cannot get es.tar"
+  fi
+	kubectl -n ${DR_CORE_NAMESPACE} exec -it pcs-mongo-0 -- bash -c 'rm -f /tmp/es.tar'
+	#ls -la ${LOG}|sed 's#^#| #g'
+	du -sh ${BACKUP_DIR}/es.tar|sed 's#\s\s*# #g;s#^#|   |-- Backup size: #g'
+	echo "|   |-- Log file ${LOG}"
+	echo "|   '-- Elasticsearch backup-inside-of-a-pod finished ($(date +%Y-%m-%d_%H:%M:%S))"
+}
+
+#### #### #### #### #### #### #### ####
+sort_yaml () {
+  local FILE_IN="$1"
+  local FILE_OUT="$2"
+  [ -z "${FILE_IN}" ] && ERROR "Input yaml file not specified"
+  [ -z "${FILE_OUT}" ] && FILE_OUT="${FILE_IN}.sorted.yaml"
+  [ ! -f "${FILE_IN}" ] && echo "Input yaml file ${FILE_IN} not found" && exit 1
+  local TEMP1=.tnp.json
+  local TEMP2=.tmp_sorted.json
+
+  python3 - << EOF > ${TEMP1} || exit 1
+import sys, json
+
+def parse_yaml_simple(lines):
+    result = {}
+    stack = [result]
+    indent_stack = [0]
+
+    for line in lines:
+        line = line.rstrip()
+        if not line or line.lstrip().startswith('#'):
+            continue
+        indent = len(line) - len(line.lstrip())
+        key_value = line.lstrip().split(":", 1)
+        if len(key_value) != 2:
+            continue
+        key, value = key_value
+        key = key.strip()
+        value = value.strip()
+        if value == '':
+            value = {}
+        # Determine current parent by indentation
+        while indent < indent_stack[-1]:
+            stack.pop()
+            indent_stack.pop()
+        parent = stack[-1]
+        parent[key] = value if isinstance(value, str) else {}
+        if isinstance(value, dict):
+            stack.append(parent[key])
+            indent_stack.append(indent + 2)
+    return result
+
+lines = open('${FILE_IN}').readlines()
+json.dump(parse_yaml_simple(lines), sys.stdout, indent=2)
+EOF
+
+  jq '
+def walk(f):
+  . as $in
+  | if type == "object" then
+      reduce keys[] as $k ({}; . + { ($k): ($in[$k] | walk(f)) }) | f
+    elif type == "array" then
+      map(walk(f)) | f
+    else
+      f
+    end;
+walk(if type == "object" then
+       to_entries | sort_by(.key) | from_entries
+     else . end)
+' ${TEMP1} > ${TEMP2} || exit 1
+
+  python3 - << EOF > ${FILE_OUT} || exit 1
+import sys, json
+
+def json_to_yaml(obj, indent=0):
+    sp = '  ' * indent
+    if isinstance(obj, dict):
+        for k in obj:
+            v = obj[k]
+            if isinstance(v, (dict, list)):
+                print(f"{sp}{k}:")
+                json_to_yaml(v, indent+1)
+            else:
+                print(f"{sp}{k}: {v}")
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                print(f"{sp}-")
+                json_to_yaml(item, indent+1)
+            else:
+                print(f"{sp}- {item}")
+    else:
+        print(f"{sp}{obj}")
+
+data = json.load(open('${TEMP2}'))
+json_to_yaml(data)
+EOF
+
+  rm -f ${TEMP1} ${TEMP2}
+  echo "Source file:    ${FILE_IN}"
+  echo "Generated file: ${FILE_OUT}"
+
+}
+
+#### #### #### #### #### #### #### ####
+#### #### #### #### #### #### #### ####
+#### MAIN Main Program
+#### #### #### #### #### #### #### ####
+DR_CURRENT_VERSION=''
+DR_CORE_NAMESPACE=''
+DR_APP_HELM_RELEASE_NAME=''
+DR_PCS_HELM_RELEASE_NAME=''
+K_LINE=''
+DR_UPGRADE_VERSION=''
+CLOUD=''
+PGSQL_FORWARD_LINE="port-forward svc/pcs-postgresql --address 127.0.0.1 5433:5432"
+MONGO_FORWARD_LINE="port-forward svc/pcs-mongo-0 --address 127.0.0.1 27018:27017"
+
+[ -z "$1" ] && usage_info
+ACTION=$(echo "$1"|tr 'A-Z' 'a-z'|sed 's/^-*//g')
+shift
+case "${ACTION}" in
+  'help'|'?'|'h')
+    usage_info
+	  ;;
+  'sort-yaml'|'sort')
+    sort_yaml "$1" "$2"
+	  ;;
+	'upgrade'|'dr-upgrade'|'update') 
+		ACTION="upgrade"
+		system_check
+		dr_upgrade "$1" "$2" "$3"
+		;;
+	'upgrade10'|'dr-upgrade10'|'update10') 
+		ACTION="upgrade10"
+		system_check
+		dr_upgrade10 "$1" "$2" "$3"
+		;;
+	'scale-down')
+		system_check
+		scale_down "$1"
+		;;
+	'scale-up')
+		system_check
+		scale_up
+		;;
+	'scale-show')
+		system_check
+		scale_show
+		;;
+	'dr-restart'|'restart')
+		ACTION="restart"
+		system_check
+		dr_restart
+		;;
+	'watch')
+		system_check
+		mywatch
+		;;
+	'show')
+		system_check
+		myshow
+		;;
+	'backup')
+		system_check
+		dr_backup "$1" "$2"
+		;;
+	'load-images'|'load')
+		ACTION="load"
+		load_images "$1" "$2"
+		;;
+	'push-images'|'push')
+		ACTION="push"
+		#system_check
+		push_images "$1"
+		;;
+	'mongo-forward-on')
+		system_check
+		forward_finish mongo
+		forward_start mongo
+		;;
+	'mongo-forward-off')
+		system_check
+		forward_finish mongo
+		;;
+	'pgsql-forward-on')
+		system_check
+		forward_finish pgsql
+		forward_start pgsql
+		;;
+	'pgsql-forward-off')
+		system_check
+		forward_finish pgsql
+		;;
+	'pgsql-info')
+		system_check
+		pgsql_info
+		;;
+	'mongo-info')
+		system_check
+		mongo_info
+		;;
+  'es-info'|'elasticsearch-info'|'elastic-info')
+    system_check
+    es_info
+    ;;
+	'examples')
+		usage_examples
+		;;
+	*) usage_info
+		;;
+esac
+
+#### #### #### #### #### #### #### ####
+#### End
+#### #### #### #### #### #### #### ####
