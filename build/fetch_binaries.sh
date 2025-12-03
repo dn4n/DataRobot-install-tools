@@ -43,9 +43,10 @@ get_termshark() {
       wget "$LINK" -O /tmp/termshark.tar.gz && \
       tar -zxvf /tmp/termshark.tar.gz && \
       mv "termshark_${VERSION}_linux_${TERM_ARCH}/termshark" /tmp/termshark && \
-      chmod +x /tmp/termshark
+      chmod +x /tmp/termshark && rm -rf /tmp/termshark.tar.gz
       ;;
   esac
+  
 }
 
 get_grpcurl() {
@@ -59,7 +60,7 @@ get_grpcurl() {
   wget "$LINK" -O /tmp/grpcurl.tar.gz  && \
   tar --no-same-owner -zxvf /tmp/grpcurl.tar.gz && \
   mv "grpcurl" /tmp/grpcurl && \
-  chmod +x /tmp/grpcurl
+  chmod +x /tmp/grpcurl && rm -rf /tmp/grpcurl.tar.gz
   chown root:root /tmp/grpcurl
 }
 
@@ -74,13 +75,35 @@ get_fortio() {
   wget "$LINK" -O /tmp/fortio.tgz  && \
   tar -zxvf /tmp/fortio.tgz && \
   mv "usr/bin/fortio" /tmp/fortio && \
-  chmod +x /tmp/fortio
+  chmod +x /tmp/fortio &&  rm -rf /tmp/fortio.tgz
 }
 
-
+get_oc() {
+  mkdir -p /ocp-tools/ && wget https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz -P /ocp-tools  && \
+  cd /ocp-tools && \
+  chmod +x * && \
+  tar xvf openshift-client-linux.tar.gz oc kubectl && \
+  cp oc kubectl /tmp/ && rm -rf /ocp-tools 
+}
+# Install MongoDB database tools
+get_mongotools() {
+    wget  "https://fastdl.mongodb.org/tools/db/mongodb-database-tools-debian11-x86_64-100.13.0.tgz" -P /tmp/ \
+    && tar -xzf /tmp/mongodb-database-tools-debian11-x86_64-100.13.0.tgz -C /tmp \
+    && mv /tmp/mongodb-database-tools-debian11-x86_64-100.13.0/bin/* /tmp/ \
+    && rm -rf /tmp/mongodb-database-tools-debian11-x86_64-100.13.0.tgz /tmp/mongodb-database-tools-debian11-x86_64-100.13.0 && \
+    curl -L https://downloads.mongodb.com/compass/mongosh-2.5.9-linux-x64.tgz -o /tmp/mongosh.tgz && \
+    tar -zxvf /tmp/mongosh.tgz -C /tmp && \
+    mv /tmp/mongosh-2.5.9-linux-x64/bin/mongosh /tmp/mongosh && \
+    rm -rf /tmp/mongosh.tgz /tmp/mongosh-2.5.9-linux-x64
+}
+get_mclient() {
+    curl  -L https://dl.min.io/aistor/mc/release/linux-amd64/mc -o /tmp/mcli
+}
+get_mclient
 get_ctop
 get_calicoctl
 get_termshark
 get_grpcurl
 get_fortio
-
+get_oc
+get_mongotools
